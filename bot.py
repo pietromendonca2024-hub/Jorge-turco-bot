@@ -192,7 +192,8 @@ SYSTEMS = {
 
 DASHBOARD_PAGES = {
     1: ["boas_vindas", "registro", "vendas", "banco", "farm", "acoes", "hierarquia", "ausencia"],
-    2: ["lavagem", "encomendas", "bau", "advertencias", "ranking", "metas", "promocoes", "inicio", "logs", "seguranca", "backup", "personalizacao", "utilidades"],
+    2: ["lavagem", "encomendas", "bau", "advertencias", "ranking", "metas", "promocoes"],
+    3: ["inicio", "logs", "seguranca", "backup", "personalizacao", "utilidades"],
 }
 
 DEFAULTS = {
@@ -650,8 +651,9 @@ APPROVAL_SYSTEMS = {"registro", "encomendas", "ausencia", "farm"}
 
 
 def dashboard_header(page: int):
+    total_pages = len(DASHBOARD_PAGES)
     return (
-        f"# DashBoard Bot Facção ({page}/2)\n"
+        f"# DashBoard Bot Facção ({page}/{total_pages})\n"
         "Painel central de configurações do bot. Utilize os botões ao lado para acessar cada área."
     )
 
@@ -821,12 +823,18 @@ class DashboardLayout(discord.ui.LayoutView):
             )
 
         nav = discord.ui.ActionRow()
-        if page == 1:
-            nav.add_item(discord.ui.Button(label="←", style=discord.ButtonStyle.secondary, disabled=True))
-            nav.add_item(DashboardNavButton(2, "next"))
+        total_pages = len(DASHBOARD_PAGES)
+
+        if page > 1:
+            nav.add_item(DashboardNavButton(page - 1, "back"))
         else:
-            nav.add_item(DashboardNavButton(1, "back"))
+            nav.add_item(discord.ui.Button(label="←", style=discord.ButtonStyle.secondary, disabled=True))
+
+        if page < total_pages:
+            nav.add_item(DashboardNavButton(page + 1, "next"))
+        else:
             nav.add_item(discord.ui.Button(label="→", style=discord.ButtonStyle.secondary, disabled=True))
+
         nav.add_item(ResetDashboardButton(page))
         container.add_item(nav)
         self.add_item(container)
