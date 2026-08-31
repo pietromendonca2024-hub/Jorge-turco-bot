@@ -2177,13 +2177,22 @@ async def send_public_panel(guild, channel, system):
         "acoes": AcoesPanel(),
         "hierarquia": HierarquiaPanel(),
         "ranking": RankingPublicPanel(),
+        "metas": MetasPanel(),
+        "inicio": ComeceAquiView(),
     }
     if system == "hierarquia":
         e = await hierarchy_embed_for_guild(guild)
     elif system == "ranking":
         e = await ranking_embed_for_guild(guild)
+    elif system == "metas":
+        e = weekly_ranking_embed(guild)
+    elif system == "inicio":
+        e = comece_aqui_embed(guild)
 
-    await channel.send(embed=e, view=view_map[system])
+    view = view_map.get(system)
+    if view is None:
+        raise ValueError(f"O sistema {system!r} não possui painel público.")
+    await channel.send(embed=e, view=view)
 
 # ============================================================
 # REGISTRO
@@ -5319,6 +5328,314 @@ async def on_message_delete(message):
                 RED
             )
             break
+
+
+# ============================================================
+# METAS SEMANAIS + PROMOÇÕES + CENTRAL DE INÍCIO
+# ============================================================
+
+def week_start_iso():
+    now = datetime.now(timezone.utc)
+    start = now - timedelta(
+        days=now.weekday(),
+        hours=now.hour,
+        minutes=now.minute,
+        seconds=now.second,
+        microseconds=now.microsecond
+    )
+    return start.isoformat()
+
+
+def weekly_member_stats(guild_id: int, user_id: int):
+    start = week_start_iso()
+    conn = connect()
+
+    farm_row = conn.execute(
+        """SELECT COALESCE(SUM(quantidade),0) total
+           FROM farms
+           WHERE guild_id=? AND user_id=? AND status='aprovado' AND created_at>=?""",
+        (guild_id, user_id, start)
+    ).fetchone()
+
+    sales_row = conn.execute(
+        """SELECT COALESCE(SUM(total),0) total
+           FROM vendas
+           WHERE guild_id=? AND user_id=? AND created_at>=?""",
+        (guild_id, user_id, start)
+    ).fetchone()
+
+    actions_row = conn.execute(
+        """SELECT COUNT(DISTINCT ap.action_id) total
+           FROM acoes_participantes ap
+           JOIN acoes a ON a.id=ap.action_id
+           WHERE ap.guild_id=? AND ap.user_id=?
+             AND a.status!='aberta'
+             AND COALESCE(a.closed_at,a.created_at)>=?""",
+        (guild_id, user_id, start)
+    ).fetchone()
+
+    points_row = conn.execute(
+        "SELECT pontos FROM pontos WHERE guild_id=? AND user_id=?",
+        (guild_id, user_id)
+    ).fetchone()
+
+    warnings_row = conn.execute(
+        """SELECT COUNT(*) qtd, COALESCE(SUM(pontos),0) pontos
+           FROM advertencias
+           WHERE guild_id=? AND user_id=? AND active=1""",
+        (guild_id, user_id)
+    ).fetchone()
+
+    conn.close()
+    return {
+        "farm": int(farm_row["total"] or 0),
+        "sales": float(sales_row["total"] or 0),
+        "actions": int(actions_row["total"] or 0),
+        "points": int(points_row["pontos"] if points_row else 0),
+        "warnings": int(warnings_row["qtd"] or 0),
+        "warning_points": int(warnings_row["pontos"] or 0),
+    }
+
+
+def goal_bar(current, goal, size=10):
+    if goal <= 0:
+        return "██████████ 100%"
+    ratio = max(0.0, min(float(current) / float(goal), 1.0))
+    filled = round(ratio * size)
+    pct = round(ratio * 100)
+    return "█" * filled + "░" * (size - filled) + f" {pct}%"
+
+
+def metas_embed_for_member(guild: discord.Guild, member: discord.Member):
+    cfg = get_config(guild.id, "metas")
+    stats = weekly_member_stats(guild.id, member.id)
+    farm_goal = max(0, int(cfg.get("weekly_farm_goal", 500)))
+    sales_goal = max(0, float(cfg.get("weekly_sales_goal", 2000000)))
+    actions_goal = max(0, int(cfg.get("weekly_actions_goal", 3)))
+
+    desc = (
+        f"**Membro:** {member.mention}\n"
+        f"**Semana iniciada em:** <t:{int(datetime.fromisoformat(week_start_iso()).timestamp())}:d>\n\n"
+        f"📦 **Farm:** {stats['farm']}/{farm_goal}\n`{goal_bar(stats['farm'], farm_goal)}`\n\n"
+        f"💰 **Vendas:** {money(stats['sales'])}/{money(sales_goal)}\n"
+        f"`{goal_bar(stats['sales'], sales_goal)}`\n\n"
+        f"🎯 **Ações:** {stats['actions']}/{actions_goal}\n"
+        f"`{goal_bar(stats['actions'], actions_goal)}`"
+    )
+    return embed(
+        "🎯 Metas Semanais",
+        desc,
+        guild_id=guild.id,
+        use_theme_image=False,
+        use_theme_thumbnail=True
+    )
+
+
+def weekly_ranking_embed(guild: discord.Guild):
+    cfg = get_config(guild.id, "metas")
+    farm_goal = max(1, int(cfg.get("weekly_farm_goal", 500)))
+    sales_goal = max(1.0, float(cfg.get("weekly_sales_goal", 2000000)))
+    actions_goal = max(1, int(cfg.get("weekly_actions_goal", 3)))
+
+    candidates = [m for m in guild.members if not m.bot]
+    rows = []
+    for member in candidates:
+        st = weekly_member_stats(guild.id, member.id)
+        score = (
+            min(st["farm"] / farm_goal, 1.0) +
+            min(st["sales"] / sales_goal, 1.0) +
+            min(st["actions"] / actions_goal, 1.0)
+        ) / 3 * 100
+        if st["farm"] or st["sales"] or st["actions"]:
+            rows.append((score, member.id, st))
+    rows.sort(reverse=True, key=lambda x: x[0])
+    lines = []
+    for i, (score, uid, st) in enumerate(rows[:15], 1):
+        lines.append(
+            f"**{i}.** <@{uid}> — **{score:.0f}%** "
+            f"• 📦 {st['farm']} • 💰 {money(st['sales'])} • 🎯 {st['actions']}"
+        )
+    return embed(
+        "🏆 Ranking Semanal",
+        "\n".join(lines) or "Ainda não há atividade registrada nesta semana.",
+        guild_id=guild.id,
+        use_theme_image=False,
+        use_theme_thumbnail=True
+    )
+
+
+class WeeklyGoalsModal(discord.ui.Modal, title="Configurar Metas Semanais"):
+    farm = discord.ui.TextInput(label="Meta de farm", placeholder="500", max_length=12)
+    sales = discord.ui.TextInput(label="Meta de vendas (R$)", placeholder="2000000", max_length=20)
+    actions = discord.ui.TextInput(label="Meta de participação em ações", placeholder="3", max_length=6)
+
+    async def on_submit(self, interaction):
+        if not is_admin(interaction.user):
+            return await deny(interaction)
+        try:
+            farm = parse_int(self.farm)
+            sales = parse_money(self.sales)
+            actions = parse_int(self.actions)
+            if farm < 0 or sales < 0 or actions < 0:
+                raise ValueError
+        except ValueError:
+            return await interaction.response.send_message("❌ Informe metas válidas.", ephemeral=True)
+
+        update_config(
+            interaction.guild.id,
+            "metas",
+            enabled=True,
+            weekly_farm_goal=farm,
+            weekly_sales_goal=sales,
+            weekly_actions_goal=actions
+        )
+        await interaction.response.send_message(
+            f"✅ Metas atualizadas:\n📦 **{farm}**\n💰 **{money(sales)}**\n🎯 **{actions} ações**",
+            ephemeral=True
+        )
+
+
+class MetasPanel(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Minhas Metas", emoji="🎯", style=discord.ButtonStyle.primary, custom_id="public:metas:me")
+    async def my_goals(self, interaction, button):
+        await interaction.response.send_message(
+            embed=metas_embed_for_member(interaction.guild, interaction.user),
+            ephemeral=True
+        )
+
+    @discord.ui.button(label="Ranking Semanal", emoji="🏆", style=discord.ButtonStyle.secondary, custom_id="public:metas:rank")
+    async def rank(self, interaction, button):
+        await interaction.response.send_message(
+            embed=weekly_ranking_embed(interaction.guild),
+            ephemeral=True
+        )
+
+
+class ComeceAquiView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Registro", emoji="👤", style=discord.ButtonStyle.success, custom_id="public:inicio:registro")
+    async def registro(self, interaction, button):
+        if not enabled(interaction.guild.id, "registro"):
+            return await deny(interaction, "❌ O sistema de registro está desligado.")
+        await interaction.response.send_modal(RegistroModal())
+
+    @discord.ui.button(label="Minhas Metas", emoji="🎯", style=discord.ButtonStyle.primary, custom_id="public:inicio:metas")
+    async def metas(self, interaction, button):
+        await interaction.response.send_message(
+            embed=metas_embed_for_member(interaction.guild, interaction.user),
+            ephemeral=True
+        )
+
+    @discord.ui.button(label="Ranking", emoji="🏆", style=discord.ButtonStyle.secondary, custom_id="public:inicio:ranking")
+    async def ranking(self, interaction, button):
+        await interaction.response.send_message(
+            embed=await ranking_embed_for_guild(interaction.guild),
+            ephemeral=True
+        )
+
+
+def comece_aqui_embed(guild: discord.Guild):
+    rules = next((c for c in guild.text_channels if c.name.endswith("regras") or c.name == "regras"), None)
+    hierarchy = next((c for c in guild.text_channels if "hierarquia" in c.name.lower()), None)
+    register = next((c for c in guild.text_channels if c.name.endswith("registro") or c.name == "registro"), None)
+    metas = next((c for c in guild.text_channels if "metas" in c.name.lower()), None)
+
+    def mention(ch):
+        return ch.mention if ch else "canal configurado pela liderança"
+
+    desc = (
+        "Bem-vindo(a)! Use esta central para seguir o fluxo da organização.\n\n"
+        f"**1. 📜 Regras** — leia {mention(rules)}.\n"
+        f"**2. 👤 Registro** — faça seu registro em {mention(register)} ou pelo botão abaixo.\n"
+        f"**3. 🏰 Hierarquia** — consulte {mention(hierarchy)}.\n"
+        "**4. 📦 Participação** — Farm, Vendas e Ações contam para sua atividade.\n"
+        f"**5. 🎯 Metas** — acompanhe seu progresso em {mention(metas)} ou pelo botão abaixo.\n"
+        "**6. ⬆️ Evolução** — a liderança pode analisar metas, ranking, ações e advertências antes de uma promoção."
+    )
+    return embed(
+        "👋 Comece Aqui",
+        desc,
+        guild_id=guild.id,
+        use_theme_image=True,
+        use_theme_thumbnail=True
+    )
+
+
+@app_commands.command(name="metas", description="Mostra suas metas e progresso da semana")
+async def metas_cmd(interaction: discord.Interaction):
+    await interaction.response.send_message(
+        embed=metas_embed_for_member(interaction.guild, interaction.user),
+        ephemeral=True
+    )
+
+
+@app_commands.command(name="configurar-metas", description="Configura as metas semanais da facção")
+@app_commands.default_permissions(administrator=True)
+async def configurar_metas(interaction: discord.Interaction):
+    if not is_admin(interaction.user):
+        return await deny(interaction)
+    await interaction.response.send_modal(WeeklyGoalsModal())
+
+
+@app_commands.command(name="analisar-promocao", description="Analisa atividade, metas e advertências de um membro")
+@app_commands.default_permissions(administrator=True)
+async def analisar_promocao(interaction: discord.Interaction, membro: discord.Member):
+    if not is_admin(interaction.user):
+        return await deny(interaction)
+
+    cfg = get_config(interaction.guild.id, "metas")
+    st = weekly_member_stats(interaction.guild.id, membro.id)
+    fg = max(1, int(cfg.get("weekly_farm_goal", 500)))
+    sg = max(1.0, float(cfg.get("weekly_sales_goal", 2000000)))
+    ag = max(1, int(cfg.get("weekly_actions_goal", 3)))
+
+    activity = (
+        min(st["farm"] / fg, 1.0) +
+        min(st["sales"] / sg, 1.0) +
+        min(st["actions"] / ag, 1.0)
+    ) / 3 * 75
+    ranking_bonus = min(max(st["points"], 0), 100) / 100 * 25
+    penalty = min(st["warning_points"] * 12, 50)
+    score = max(0, min(100, round(activity + ranking_bonus - penalty)))
+
+    if score >= 80 and st["warnings"] == 0:
+        verdict = "🟢 **Bom candidato para análise da liderança**"
+    elif score >= 55:
+        verdict = "🟡 **Candidato em observação**"
+    else:
+        verdict = "🔴 **Ainda precisa evoluir antes da promoção**"
+
+    desc = (
+        f"**Membro:** {membro.mention}\n{verdict}\n"
+        f"**Índice de apoio:** {score}/100\n\n"
+        f"🏆 **Pontos gerais:** {st['points']}\n"
+        f"⚠️ **Advertências ativas:** {st['warnings']} ({st['warning_points']} pts)\n"
+        f"📦 **Farm semanal:** {st['farm']}/{fg}\n"
+        f"💰 **Vendas semanais:** {money(st['sales'])}/{money(sg)}\n"
+        f"🎯 **Ações semanais:** {st['actions']}/{ag}\n\n"
+        "ℹ️ Este resultado é apenas apoio para a liderança. O bot não promove automaticamente."
+    )
+    await interaction.response.send_message(
+        embed=embed("⬆️ Análise de Promoção", desc, guild_id=interaction.guild.id),
+        ephemeral=True
+    )
+
+
+@app_commands.command(name="comece-aqui", description="Envia a central de início no canal atual")
+@app_commands.default_permissions(administrator=True)
+async def comece_aqui(interaction: discord.Interaction):
+    if not is_admin(interaction.user):
+        return await deny(interaction)
+    await interaction.response.send_message(
+        embed=comece_aqui_embed(interaction.guild),
+        view=ComeceAquiView()
+    )
+
 
 # ============================================================
 # COMANDOS PRINCIPAIS
