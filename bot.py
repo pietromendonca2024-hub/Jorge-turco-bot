@@ -1,0 +1,4373 @@
+
+import os
+import io
+import json
+import time
+import sqlite3
+import asyncio
+import traceback
+from pathlib import Path
+from datetime import datetime, timedelta, timezone
+from collections import defaultdict, deque
+
+import discord
+from discord import app_commands
+from discord.ext import commands, tasks
+from dotenv import load_dotenv
+
+# ============================================================
+# BOT FACÇÃO PRO — REBUILD DO ZERO
+# Interface inspirada nos vídeos enviados:
+# - /gerenciar abre um dashboard privado
+# - cada sistema possui tela própria de configuração
+# - Status / Logs / Cargos / URL / opções específicas
+# - painéis públicos usam botões + modais
+# ============================================================
+
+load_dotenv()
+
+TOKEN = os.getenv("DISCORD_TOKEN")
+GUILD_ID = os.getenv("GUILD_ID", "")
+FAC_NAME = os.getenv("FAC_NAME", "JORGE TURCO")
+DB_PATH = os.getenv("DB_PATH", "faccao.db")
+BACKUP_DIR = Path(os.getenv("BACKUP_DIR", "backups"))
+BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+AUTO_SYNC_COMMANDS = os.getenv("AUTO_SYNC_COMMANDS", "1").strip().lower() not in {"0", "false", "no"}
+
+if not TOKEN:
+    raise RuntimeError("DISCORD_TOKEN não configurado.")
+
+# -------- Discord --------
+intents = discord.Intents.default()
+intents.guilds = True
+intents.members = True
+intents.message_content = True
+intents.voice_states = True
+intents.moderation = True
+
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+# -------- Aparência --------
+GOLD = 0xC89B3C
+GREEN = 0x57F287
+RED = 0xED4245
+BLUE = 0x5865F2
+GREY = 0x2B2D31
+FOOTER = f"{FAC_NAME} • Facção Pro"
+
+# -------- Sistemas --------
+SYSTEMS = {
+    # Página 1 — igual ao painel principal da referência
+    "boas_vindas": {
+        "label": "Boas Vindas", "emoji": "🏠",
+        "description": "Configure a mensagem privada enviada para novos membros.",
+        "public_title": "🏠 BOAS VINDAS", "public_description": "Sistema de boas-vindas da organização.",
+        "has_public_panel": False,
+    },
+    "registro": {
+        "label": "Registro", "emoji": "👤",
+        "description": "Configure o sistema de registro de novos membros.",
+        "public_title": "👤 CENTRAL DE REGISTRO",
+        "public_description": "Realize seu registro utilizando o botão abaixo. Após o envio, aguarde a análise da liderança.",
+        "has_public_panel": True,
+    },
+    "vendas": {
+        "label": "Vendas", "emoji": "💰",
+        "description": "Configure o sistema de vendas no servidor.",
+        "public_title": "💰 CENTRAL DE VENDAS", "public_description": "Registre uma nova venda através do botão abaixo.",
+        "has_public_panel": True,
+    },
+    "banco": {
+        "label": "Banco", "emoji": "🏦",
+        "description": "Configure o sistema de banco no servidor.",
+        "public_title": "🏦 CENTRAL DO BANCO", "public_description": "Utilize os botões abaixo para movimentar ou consultar o banco.",
+        "has_public_panel": True,
+    },
+    "farm": {
+        "label": "Farm", "emoji": "🌊",
+        "description": "Configure o sistema de farm.",
+        "public_title": "📦 CENTRAL DE FARM", "public_description": "Envie seu farm para aprovação.",
+        "has_public_panel": True,
+    },
+    "acoes": {
+        "label": "Ações", "emoji": "🛩️",
+        "description": "Configure o sistema de ações.",
+        "public_title": "🎯 CENTRAL DE AÇÕES", "public_description": "Consulte e registre ações da organização.",
+        "has_public_panel": True,
+    },
+    "hierarquia": {
+        "label": "Hierarquia", "emoji": "🏰",
+        "description": "Configure o sistema de Hierarquia.",
+        "public_title": "🏰 HIERARQUIA", "public_description": "Consulte a hierarquia da organização.",
+        "has_public_panel": True,
+    },
+    "ausencia": {
+        "label": "Ausência", "emoji": "⌛",
+        "description": "Configure o Sistema de Ausência.",
+        "public_title": "⌛ CENTRAL DE AUSÊNCIAS", "public_description": "Solicite uma ausência e aguarde a análise da liderança.",
+        "has_public_panel": True,
+    },
+
+    # Página 2 — restante das funções do Bot Facção Pro
+    "lavagem": {
+        "label": "Lavagem", "emoji": "💸",
+        "description": "Configure o sistema de lavagem.",
+        "public_title": "💸 CENTRAL DE LAVAGEM", "public_description": "Registre uma nova operação de lavagem.",
+        "has_public_panel": True,
+    },
+    "encomendas": {
+        "label": "Encomendas", "emoji": "📦",
+        "description": "Configure o sistema de encomendas.",
+        "public_title": "📦 CENTRAL DE ENCOMENDAS", "public_description": "Registre pedidos para aprovação da equipe responsável.",
+        "has_public_panel": True,
+    },
+    "bau": {
+        "label": "Baús / Estoque", "emoji": "🧰",
+        "description": "Configure baú geral, baú de líder e estoque.",
+        "public_title": "🧰 CENTRAL DE BAÚ", "public_description": "Registre entradas, retiradas e consulte o estoque.",
+        "has_public_panel": True,
+    },
+    "advertencias": {
+        "label": "Advertências", "emoji": "⚠️",
+        "description": "Configure advertências e punições de membros.",
+        "public_title": "⚠️ ADVERTÊNCIAS", "public_description": "Sistema interno de advertências.",
+        "has_public_panel": False,
+    },
+    "ranking": {
+        "label": "Ranking", "emoji": "🏆",
+        "description": "Configure o ranking de membros e pontuação.",
+        "public_title": "🏆 RANKING", "public_description": "Ranking geral da organização.",
+        "has_public_panel": True,
+    },
+    "logs": {
+        "label": "Logs", "emoji": "📑",
+        "description": "Configure logs de entrada, saída, ban, voz, mensagens e cargos.",
+        "public_title": "📑 LOGS", "public_description": "Sistema interno de logs.",
+        "has_public_panel": False,
+    },
+    "seguranca": {
+        "label": "Segurança", "emoji": "🛡️",
+        "description": "Configure Anti-Spam e Anti-Raid.",
+        "public_title": "🛡️ SEGURANÇA", "public_description": "Sistema interno de segurança.",
+        "has_public_panel": False,
+    },
+    "backup": {
+        "label": "Backup", "emoji": "💾",
+        "description": "Configure backup automático e restauração.",
+        "public_title": "💾 BACKUP", "public_description": "Sistema interno de backup.",
+        "has_public_panel": False,
+    },
+    "personalizacao": {
+        "label": "Personalização", "emoji": "🎨",
+        "description": "Configure status, nome, perfil e apresentação do bot.",
+        "public_title": "🎨 PERSONALIZAÇÃO", "public_description": "Sistema interno de personalização.",
+        "has_public_panel": False,
+    },
+    "utilidades": {
+        "label": "Utilidades", "emoji": "🧩",
+        "description": "Configure embeds, anúncio privado, limpeza e central de ajuda.",
+        "public_title": "🧩 UTILIDADES", "public_description": "Ferramentas administrativas.",
+        "has_public_panel": False,
+    },
+}
+
+DASHBOARD_PAGES = {
+    1: ["boas_vindas", "registro", "vendas", "banco", "farm", "acoes", "hierarquia", "ausencia"],
+    2: ["lavagem", "encomendas", "bau", "advertencias", "ranking", "logs", "seguranca", "backup", "personalizacao", "utilidades"],
+}
+
+DEFAULTS = {
+    "enabled": False,
+    "log_channel_id": None,
+    "access_role_ids": [],
+    "approver_role_ids": [],
+    "embed_url": "",
+    "approved_role_id": None,
+    "visitor_enabled": False,
+    "visitor_role_id": None,
+    "name_pattern": "{id} | {nome}",
+    "products": [],
+    "farm_items": [],
+    "stock_items": [],
+    "partner_discount": 0,
+    "laundry_rate": 25.0,
+    "member_role_id": None,
+    "public_channel_id": None,
+    "welcome_channel_id": None,
+    "welcome_message": "Bem-vindo(a), {membro}!",
+    "welcome_channel_id": None,
+    "theme_color": "#C89B3C",
+    "message_image_url": "",
+    "message_thumbnail_url": "",
+    "message_footer_text": "",
+    "hierarchy_role_ids": [],
+    "leader_role_ids": [],
+    "action_ping_role_id": None,
+    "sale_points": 2,
+    "register_points": 5,
+    "farm_points_divisor": 100,
+    "spam_count": 6,
+    "spam_window": 5,
+    "spam_timeout": 45,
+    "raid_count": 10,
+    "raid_window": 15,
+    "anti_spam_enabled": True,
+    "anti_raid_enabled": True,
+    "auto_backup_enabled": True,
+}
+
+# ============================================================
+# BANCO DE DADOS
+# ============================================================
+
+def connect():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def now_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+def init_db():
+    conn = connect()
+    c = conn.cursor()
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS system_config (
+            guild_id INTEGER NOT NULL,
+            system TEXT NOT NULL,
+            data TEXT NOT NULL,
+            PRIMARY KEY(guild_id, system)
+        )
+    """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS registros (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            guild_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            nome TEXT NOT NULL,
+            identificacao TEXT NOT NULL,
+            telefone TEXT,
+            recrutador TEXT,
+            status TEXT NOT NULL DEFAULT 'pendente',
+            reviewer_id INTEGER,
+            created_at TEXT NOT NULL
+        )
+    """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS vendas (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            guild_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            produto TEXT NOT NULL,
+            parceria INTEGER NOT NULL DEFAULT 0,
+            quantidade INTEGER NOT NULL,
+            unit_price REAL NOT NULL,
+            total REAL NOT NULL,
+            created_at TEXT NOT NULL
+        )
+    """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS banco (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            guild_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            tipo TEXT NOT NULL,
+            valor REAL NOT NULL,
+            descricao TEXT,
+            created_at TEXT NOT NULL
+        )
+    """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS lavagens (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            guild_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            bruto REAL NOT NULL,
+            taxa REAL NOT NULL,
+            liquido REAL NOT NULL,
+            created_at TEXT NOT NULL
+        )
+    """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS encomendas (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            guild_id INTEGER NOT NULL,
+            author_id INTEGER NOT NULL,
+            responsavel_id INTEGER NOT NULL,
+            descricao TEXT NOT NULL,
+            data_hora TEXT NOT NULL,
+            destinatario TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pendente',
+            reviewer_id INTEGER,
+            created_at TEXT NOT NULL
+        )
+    """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS ausencias (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            guild_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            periodo TEXT NOT NULL,
+            motivo TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pendente',
+            reviewer_id INTEGER,
+            created_at TEXT NOT NULL
+        )
+    """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS farms (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            guild_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            item TEXT NOT NULL,
+            quantidade INTEGER NOT NULL,
+            comprovante TEXT,
+            status TEXT NOT NULL DEFAULT 'pendente',
+            reviewer_id INTEGER,
+            created_at TEXT NOT NULL
+        )
+    """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS estoque (
+            guild_id INTEGER NOT NULL,
+            bau TEXT NOT NULL,
+            item TEXT NOT NULL,
+            quantidade INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY(guild_id, bau, item)
+        )
+    """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS estoque_mov (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            guild_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            bau TEXT NOT NULL,
+            tipo TEXT NOT NULL,
+            item TEXT NOT NULL,
+            quantidade INTEGER NOT NULL,
+            created_at TEXT NOT NULL
+        )
+    """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS advertencias (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            guild_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            moderator_id INTEGER NOT NULL,
+            motivo TEXT NOT NULL,
+            pontos INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL
+        )
+    """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS pontos (
+            guild_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            pontos INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY(guild_id, user_id)
+        )
+    """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS acoes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            guild_id INTEGER NOT NULL,
+            creator_id INTEGER NOT NULL,
+            nome TEXT NOT NULL,
+            descricao TEXT,
+            horario TEXT,
+            status TEXT NOT NULL DEFAULT 'aberta',
+            resultado TEXT,
+            valor_ganho REAL NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            closed_at TEXT
+        )
+    """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS acoes_participantes (
+            action_id INTEGER NOT NULL,
+            guild_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            joined_at TEXT NOT NULL,
+            PRIMARY KEY(action_id, user_id)
+        )
+    """)
+
+    conn.commit()
+    conn.close()
+
+def get_config(guild_id: int, system: str):
+    data = dict(DEFAULTS)
+    conn = connect()
+    row = conn.execute(
+        "SELECT data FROM system_config WHERE guild_id=? AND system=?",
+        (guild_id, system)
+    ).fetchone()
+    conn.close()
+    if row:
+        try:
+            saved = json.loads(row["data"])
+            if isinstance(saved, dict):
+                data.update(saved)
+        except Exception:
+            pass
+    return data
+
+def save_config(guild_id: int, system: str, data: dict):
+    conn = connect()
+    conn.execute(
+        """INSERT INTO system_config(guild_id,system,data) VALUES(?,?,?)
+           ON CONFLICT(guild_id,system) DO UPDATE SET data=excluded.data""",
+        (guild_id, system, json.dumps(data, ensure_ascii=False))
+    )
+    conn.commit()
+    conn.close()
+
+def update_config(guild_id: int, system: str, **changes):
+    cfg = get_config(guild_id, system)
+    cfg.update(changes)
+    save_config(guild_id, system, cfg)
+    return cfg
+
+def add_points(guild_id: int, user_id: int, amount: int):
+    conn = connect()
+    conn.execute(
+        """INSERT INTO pontos(guild_id,user_id,pontos) VALUES(?,?,?)
+           ON CONFLICT(guild_id,user_id) DO UPDATE SET pontos=pontos+excluded.pontos""",
+        (guild_id, user_id, amount)
+    )
+    conn.commit()
+    conn.close()
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def parse_hex_color(value, fallback=GOLD):
+    try:
+        s = str(value or "").strip().replace("#", "")
+        if len(s) == 3:
+            s = "".join(ch * 2 for ch in s)
+        if len(s) != 6:
+            raise ValueError
+        return int(s, 16)
+    except Exception:
+        return fallback
+
+
+def get_theme(guild_id=None):
+    if not guild_id:
+        return {
+            "color": GOLD,
+            "image": "",
+            "thumbnail": "",
+            "footer": FOOTER,
+        }
+
+    try:
+        cfg = get_config(guild_id, "personalizacao")
+    except Exception:
+        cfg = {}
+
+    footer = str(cfg.get("message_footer_text") or "").strip() or FOOTER
+    return {
+        "color": parse_hex_color(cfg.get("theme_color"), GOLD),
+        "image": str(cfg.get("message_image_url") or "").strip(),
+        "thumbnail": str(cfg.get("message_thumbnail_url") or "").strip(),
+        "footer": footer,
+    }
+
+
+def embed(
+    title,
+    description="",
+    color=None,
+    image_url="",
+    guild_id=None,
+    thumbnail_url="",
+    use_theme_image=False,
+    use_theme_thumbnail=True
+):
+    theme = get_theme(guild_id)
+    resolved_color = theme["color"] if color is None else color
+    e = discord.Embed(title=title, description=description, color=resolved_color)
+
+    # Imagem grande não é mais aplicada em TODAS as mensagens.
+    # Ela aparece apenas em painéis/embeds onde use_theme_image=True.
+    explicit_image = str(image_url or "").strip()
+    final_image = explicit_image or (theme["image"] if use_theme_image else "")
+
+    explicit_thumbnail = str(thumbnail_url or "").strip()
+    final_thumbnail = explicit_thumbnail or (theme["thumbnail"] if use_theme_thumbnail else "")
+
+    if final_image:
+        e.set_image(url=final_image)
+    if final_thumbnail:
+        e.set_thumbnail(url=final_thumbnail)
+
+    e.set_footer(text=theme["footer"])
+    return e
+
+def role_mentions(guild, ids):
+    values = []
+    for rid in ids or []:
+        role = guild.get_role(int(rid))
+        if role:
+            values.append(role.mention)
+    return ", ".join(values) if values else "Nenhum cargo configurado."
+
+def channel_mention(guild, cid):
+    if not cid:
+        return "Nenhum canal configurado."
+    ch = guild.get_channel(int(cid))
+    return ch.mention if ch else "Canal não encontrado."
+
+def role_mention(guild, rid):
+    if not rid:
+        return "Nenhum cargo configurado."
+    role = guild.get_role(int(rid))
+    return role.mention if role else "Cargo não encontrado."
+
+def is_admin(member: discord.Member):
+    return member.guild_permissions.administrator
+
+def has_access(member: discord.Member, system: str):
+    if is_admin(member):
+        return True
+    cfg = get_config(member.guild.id, system)
+    allowed = {int(x) for x in cfg.get("access_role_ids", [])}
+    if not allowed:
+        return False
+    return any(r.id in allowed for r in member.roles)
+
+def can_approve(member: discord.Member, system: str):
+    if is_admin(member):
+        return True
+    cfg = get_config(member.guild.id, system)
+    allowed = {int(x) for x in cfg.get("approver_role_ids", [])}
+    if not allowed:
+        return False
+    return any(r.id in allowed for r in member.roles)
+
+def enabled(guild_id: int, system: str):
+    return bool(get_config(guild_id, system).get("enabled"))
+
+async def log_event(guild, system, title, description, color=GOLD):
+    cfg = get_config(guild.id, system)
+    cid = cfg.get("log_channel_id")
+    if not cid:
+        return
+    ch = guild.get_channel(int(cid))
+    if isinstance(ch, discord.TextChannel):
+        try:
+            await ch.send(embed=embed(title, description, color, guild_id=guild.id))
+        except Exception:
+            pass
+
+async def deny(interaction, text="❌ Você não possui permissão para utilizar esta função."):
+    if interaction.response.is_done():
+        await interaction.followup.send(text, ephemeral=True)
+    else:
+        await interaction.response.send_message(text, ephemeral=True)
+
+def money(v):
+    return f"R$ {v:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+def parse_money(text):
+    text = str(text).strip().replace("R$", "").replace(" ", "")
+    if "," in text:
+        text = text.replace(".", "").replace(",", ".")
+    else:
+        text = text.replace(".", "")
+    return float(text)
+
+def parse_int(text):
+    return int(str(text).replace(".", "").replace(",", "").strip())
+
+# ============================================================
+# DASHBOARD V2 — COMPONENTS V2 (discord.py 2.6+)
+# Reproduz o padrão visual da referência: texto à esquerda e
+# botão de edição à direita em TODAS as opções.
+# ============================================================
+
+APPROVAL_SYSTEMS = {"registro", "encomendas", "ausencia", "farm"}
+
+
+def dashboard_header(page: int):
+    return (
+        f"# DashBoard Bot Facção ({page}/2)\n"
+        "Painel central de configurações do bot. Utilize os botões ao lado para acessar cada área."
+    )
+
+
+def system_config_lines(guild: discord.Guild, system: str):
+    cfg = get_config(guild.id, system)
+    status = "🟢 Ativado" if cfg.get("enabled") else "🔴 Desativado"
+    lines = [
+        f"**Status atual:** {status}",
+        f"**Canal de logs:** {channel_mention(guild, cfg.get('log_channel_id'))}",
+        f"**Cargos de acesso:** {role_mentions(guild, cfg.get('access_role_ids', []))}",
+    ]
+    if system in APPROVAL_SYSTEMS:
+        lines.append(f"**Aprovadores:** {role_mentions(guild, cfg.get('approver_role_ids', []))}")
+    if system == "registro":
+        lines += [
+            f"**Padrão de nome:** `{cfg.get('name_pattern', '{id} | {nome}')}`",
+            f"**Cargo aprovado:** {role_mention(guild, cfg.get('approved_role_id'))}",
+            f"**Visitante:** {'🟢 Ativado' if cfg.get('visitor_enabled') else '🔴 Desativado'}",
+            f"**Cargo visitante:** {role_mention(guild, cfg.get('visitor_role_id'))}",
+        ]
+    if system == "vendas":
+        lines += [
+            f"**Produtos cadastrados:** {len(cfg.get('products', []))}",
+            f"**Desconto parceria:** {cfg.get('partner_discount', 0)}%",
+        ]
+    if system == "lavagem":
+        lines.append(f"**Taxa padrão:** {cfg.get('laundry_rate', 25)}%")
+    if system == "farm":
+        lines.append(f"**Itens configurados:** {len(cfg.get('farm_items', []))}")
+    if system == "seguranca":
+        lines += [
+            f"**Anti-Spam:** {'🟢' if cfg.get('anti_spam_enabled', True) else '🔴'}",
+            f"**Anti-Raid:** {'🟢' if cfg.get('anti_raid_enabled', True) else '🔴'}",
+        ]
+    if system == "backup":
+        lines.append(f"**Backup automático:** {'🟢' if cfg.get('auto_backup_enabled', True) else '🔴'}")
+    if system == "boas_vindas":
+        lines.append(f"**Canal público:** {channel_mention(guild, cfg.get('welcome_channel_id'))}")
+    if system == "hierarquia":
+        lines.append(f"**Cargos na hierarquia:** {role_mentions(guild, cfg.get('hierarchy_role_ids', []))}")
+    if system == "bau":
+        lines.append(f"**Cargos de líder:** {role_mentions(guild, cfg.get('leader_role_ids', []))}")
+    if system == "acoes":
+        lines.append(f"**Cargo para ping:** {role_mention(guild, cfg.get('action_ping_role_id'))}")
+    if system == "ranking":
+        lines += [
+            f"**Pontos por venda:** {cfg.get('sale_points', 2)}",
+            f"**Pontos por registro aprovado:** {cfg.get('register_points', 5)}",
+            f"**Divisor de pontos do farm:** {cfg.get('farm_points_divisor', 100)}",
+        ]
+    if system == "personalizacao":
+        lines += [
+            f"**Cor principal:** `{cfg.get('theme_color', '#C89B3C')}`",
+            f"**Imagem das mensagens:** {'Configurada' if cfg.get('message_image_url') else 'Não configurada'}",
+            f"**Miniatura:** {'Configurada' if cfg.get('message_thumbnail_url') else 'Não configurada'}",
+            f"**Rodapé:** `{cfg.get('message_footer_text') or FOOTER}`",
+        ]
+    if system == "seguranca":
+        lines += [
+            f"**Spam:** {cfg.get('spam_count', 6)} msg / {cfg.get('spam_window', 5)}s",
+            f"**Timeout:** {cfg.get('spam_timeout', 45)}s",
+            f"**Raid:** {cfg.get('raid_count', 10)} entradas / {cfg.get('raid_window', 15)}s",
+        ]
+    if cfg.get("embed_url"):
+        lines.append(f"**URL da embed:** {cfg['embed_url']}")
+    return "\n".join(lines)
+
+
+class DashboardEditButton(discord.ui.Button):
+    def __init__(self, system: str, page: int):
+        super().__init__(
+            label="Editar",
+            emoji="📝",
+            style=discord.ButtonStyle.secondary,
+            custom_id=f"dash:edit:{page}:{system}",
+        )
+        self.system = system
+        self.page = page
+
+    async def callback(self, interaction: discord.Interaction):
+        if not is_admin(interaction.user):
+            return await deny(interaction)
+        await interaction.response.edit_message(view=SystemConfigLayout(self.system, self.page, interaction.guild))
+
+
+class DashboardNavButton(discord.ui.Button):
+    def __init__(self, target_page: int, direction: str):
+        super().__init__(
+            label="←" if direction == "back" else "→",
+            style=discord.ButtonStyle.secondary,
+            custom_id=f"dash:page:{target_page}",
+        )
+        self.target_page = target_page
+
+    async def callback(self, interaction: discord.Interaction):
+        if not is_admin(interaction.user):
+            return await deny(interaction)
+        await interaction.response.edit_message(view=DashboardLayout(self.target_page))
+
+
+class DashboardHomeButton(discord.ui.Button):
+    def __init__(self, page=1):
+        super().__init__(label="🏠", style=discord.ButtonStyle.secondary, custom_id=f"dash:home:{page}")
+        self.page = page
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.edit_message(view=DashboardLayout(self.page))
+
+
+class ResetDashboardButton(discord.ui.Button):
+    def __init__(self, page: int):
+        super().__init__(
+            label="Resetar Configuração",
+            emoji="⚠️",
+            style=discord.ButtonStyle.danger,
+            custom_id=f"dash:reset:{page}",
+        )
+        self.page = page
+
+    async def callback(self, interaction: discord.Interaction):
+        if not is_admin(interaction.user):
+            return await deny(interaction)
+        await interaction.response.send_message(
+            "⚠️ Isso vai resetar as configurações dos sistemas desta página. Confirmar?",
+            view=ResetConfirmView(self.page, interaction.user.id),
+            ephemeral=True,
+        )
+
+
+class ResetConfirmView(discord.ui.View):
+    def __init__(self, page: int, author_id: int):
+        super().__init__(timeout=60)
+        self.page = page
+        self.author_id = author_id
+
+    @discord.ui.button(label="CONFIRMAR RESET", emoji="⚠️", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.author_id:
+            return await deny(interaction)
+        for system in DASHBOARD_PAGES[self.page]:
+            save_config(interaction.guild.id, system, dict(DEFAULTS))
+        await interaction.response.edit_message(content="✅ Configurações desta página resetadas.", view=None)
+
+
+class DashboardLayout(discord.ui.LayoutView):
+    def __init__(self, page: int = 1):
+        super().__init__(timeout=600)
+        page = 1 if page not in DASHBOARD_PAGES else page
+        self.page = page
+
+        container = discord.ui.Container(accent_colour=discord.Colour.from_rgb(35, 38, 32))
+        container.add_item(discord.ui.TextDisplay(dashboard_header(page)))
+        container.add_item(discord.ui.Separator())
+
+        # IMPORTANTE: Components V2 permite no máximo 40 componentes filhos
+        # por LayoutView. Cada Section conta também seus componentes internos,
+        # então não usamos um Separator após cada sistema.
+        for system in DASHBOARD_PAGES[page]:
+            meta = SYSTEMS[system]
+            text = f"**{meta['emoji']} Sistema de {meta['label']}**\n{meta['description']}"
+            container.add_item(
+                discord.ui.Section(
+                    text,
+                    accessory=DashboardEditButton(system, page),
+                )
+            )
+
+        nav = discord.ui.ActionRow()
+        if page == 1:
+            nav.add_item(discord.ui.Button(label="←", style=discord.ButtonStyle.secondary, disabled=True))
+            nav.add_item(DashboardNavButton(2, "next"))
+        else:
+            nav.add_item(DashboardNavButton(1, "back"))
+            nav.add_item(discord.ui.Button(label="→", style=discord.ButtonStyle.secondary, disabled=True))
+        nav.add_item(ResetDashboardButton(page))
+        container.add_item(nav)
+        self.add_item(container)
+
+
+class ConfigActionButton(discord.ui.Button):
+    def __init__(self, system: str, page: int, action: str, label: str, emoji: str, style=discord.ButtonStyle.secondary):
+        super().__init__(
+            label=label,
+            emoji=emoji,
+            style=style,
+            custom_id=f"cfg:{system}:{action}",
+        )
+        self.system = system
+        self.page = page
+        self.action = action
+
+    async def callback(self, interaction: discord.Interaction):
+        if not is_admin(interaction.user):
+            return await deny(interaction)
+        system = self.system
+        action = self.action
+        cfg = get_config(interaction.guild.id, system)
+
+        if action == "toggle":
+            update_config(interaction.guild.id, system, enabled=not cfg.get("enabled", False))
+            return await interaction.response.edit_message(view=SystemConfigLayout(system, self.page, interaction.guild))
+
+        if action == "logs":
+            view = discord.ui.View(timeout=120)
+            view.add_item(LogChannelSelect(system))
+            return await interaction.response.send_message("Selecione o canal de logs:", view=view, ephemeral=True)
+
+        if action == "access":
+            view = discord.ui.View(timeout=120)
+            view.add_item(AccessRoleSelect(system))
+            return await interaction.response.send_message("Selecione os cargos de acesso:", view=view, ephemeral=True)
+
+        if action == "approvers":
+            view = discord.ui.View(timeout=120)
+            view.add_item(ApproverRoleSelect(system))
+            return await interaction.response.send_message("Selecione os cargos aprovadores:", view=view, ephemeral=True)
+
+        if action == "url":
+            return await interaction.response.send_modal(URLModal(system))
+
+        if action == "special":
+            return await interaction.response.send_message(
+                view=SpecialOptionsView(system),
+                ephemeral=True,
+            )
+
+        if action == "panel":
+            if not SYSTEMS[system].get("has_public_panel"):
+                return await interaction.response.send_message(
+                    "ℹ️ Este sistema é administrativo e não possui painel público.",
+                    ephemeral=True,
+                )
+            return await interaction.response.send_message(
+                "Escolha o canal para receber o painel:",
+                view=PanelChannelView(system),
+                ephemeral=True,
+            )
+
+        if action == "security_spam":
+            update_config(interaction.guild.id, system, anti_spam_enabled=not cfg.get("anti_spam_enabled", True))
+            return await interaction.response.edit_message(view=SystemConfigLayout(system, self.page, interaction.guild))
+
+        if action == "security_raid":
+            update_config(interaction.guild.id, system, anti_raid_enabled=not cfg.get("anti_raid_enabled", True))
+            return await interaction.response.edit_message(view=SystemConfigLayout(system, self.page, interaction.guild))
+
+        if action == "backup_auto":
+            update_config(interaction.guild.id, system, auto_backup_enabled=not cfg.get("auto_backup_enabled", True))
+            return await interaction.response.edit_message(view=SystemConfigLayout(system, self.page, interaction.guild))
+
+
+class SystemConfigLayout(discord.ui.LayoutView):
+    def __init__(self, system: str, page: int, guild: discord.Guild | None = None):
+        super().__init__(timeout=600)
+        self.system = system
+        self.page = page
+        meta = SYSTEMS[system]
+
+        container = discord.ui.Container(accent_colour=discord.Colour.from_rgb(35, 38, 32))
+        container.add_item(discord.ui.TextDisplay(
+            f"# {meta['emoji']} Sistema de {meta['label']}\n{meta['description']}"
+        ))
+        container.add_item(discord.ui.Separator())
+
+        # Cada configuração também usa texto + botão à direita, igual à referência.
+        container.add_item(discord.ui.Section(
+            "**👁️ Status**\nAtive ou desative o sistema.",
+            accessory=ConfigActionButton(system, page, "toggle", "Alterar", "🔄", discord.ButtonStyle.success),
+        ))
+        container.add_item(discord.ui.Section(
+            "**🖥️ Canal de Logs**\nEscolha o canal onde os registros desse sistema serão enviados.",
+            accessory=ConfigActionButton(system, page, "logs", "Editar", "📝"),
+        ))
+        container.add_item(discord.ui.Section(
+            "**🔐 Cargos de Acesso**\nDefina quais cargos podem utilizar o sistema.",
+            accessory=ConfigActionButton(system, page, "access", "Editar", "📝"),
+        ))
+
+        if system in APPROVAL_SYSTEMS:
+            container.add_item(discord.ui.Section(
+                "**✅ Cargos de Aprovadores**\nDefina quem pode aprovar e reprovar solicitações.",
+                accessory=ConfigActionButton(system, page, "approvers", "Editar", "📝"),
+            ))
+
+        container.add_item(discord.ui.Section(
+            "**🖼️ URL na Embed**\nConfigure uma imagem para a apresentação do sistema.",
+            accessory=ConfigActionButton(system, page, "url", "Editar", "📝"),
+        ))
+        container.add_item(discord.ui.Section(
+            "**⚙️ Configurações Específicas**\nOpções próprias deste sistema.",
+            accessory=ConfigActionButton(system, page, "special", "Abrir", "⚙️", discord.ButtonStyle.primary),
+        ))
+
+        if system == "seguranca":
+            container.add_item(discord.ui.Section(
+                "**🚫 Anti-Spam**\nAtive ou desative a proteção contra spam.",
+                accessory=ConfigActionButton(system, page, "security_spam", "Alternar", "🛡️"),
+            ))
+            container.add_item(discord.ui.Section(
+                "**🚨 Anti-Raid**\nAtive ou desative a detecção de entradas em massa.",
+                accessory=ConfigActionButton(system, page, "security_raid", "Alternar", "🛡️"),
+            ))
+
+        if system == "backup":
+            container.add_item(discord.ui.Section(
+                "**💾 Backup Automático**\nAtive ou desative a rotina automática de backup.",
+                accessory=ConfigActionButton(system, page, "backup_auto", "Alternar", "🔄"),
+            ))
+
+        if meta.get("has_public_panel"):
+            container.add_item(discord.ui.Section(
+                "**📨 Enviar Painel**\nPublique o painel deste sistema no canal escolhido.",
+                accessory=ConfigActionButton(system, page, "panel", "Enviar", "📨", discord.ButtonStyle.primary),
+            ))
+
+        container.add_item(discord.ui.Separator())
+        container.add_item(discord.ui.TextDisplay(
+            "## Configuração atual\n" + (system_config_lines(guild, system) if guild else system_config_lines_placeholder(system))
+        ))
+
+        nav = discord.ui.ActionRow()
+        nav.add_item(DashboardHomeButton(page))
+        nav.add_item(DashboardNavButton(page, "back") if False else discord.ui.Button(label="← Voltar", style=discord.ButtonStyle.secondary, custom_id=f"cfgback:{page}"))
+        # callback dinâmico do botão Voltar
+        back_btn = nav.children[-1]
+        async def _back(interaction: discord.Interaction):
+            await interaction.response.edit_message(view=DashboardLayout(page))
+        back_btn.callback = _back
+        container.add_item(nav)
+        self.add_item(container)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if not is_admin(interaction.user):
+            await deny(interaction)
+            return False
+        # Atualiza o resumo visual antes de cada interação futura quando a tela for refeita.
+        return True
+
+
+def system_config_lines_placeholder(system: str):
+    # O LayoutView é construído antes de receber Interaction/Guild. A tela mostra
+    # os controles; após cada alteração ela é reconstruída. O estado detalhado
+    # é exibido na resposta das opções e no status visual dos controles.
+    meta = SYSTEMS[system]
+    return f"Sistema: **{meta['label']}** • alterações salvas automaticamente."
+
+
+class AccessRoleSelect(discord.ui.RoleSelect):
+    def __init__(self, system):
+        self.system = system
+        super().__init__(placeholder="Selecione até 5 cargos de acesso", min_values=0, max_values=5)
+    async def callback(self, interaction):
+        update_config(interaction.guild.id, self.system, access_role_ids=[r.id for r in self.values])
+        await interaction.response.send_message("✅ Cargos de acesso atualizados.", ephemeral=True)
+
+
+class ApproverRoleSelect(discord.ui.RoleSelect):
+    def __init__(self, system):
+        self.system = system
+        super().__init__(placeholder="Selecione até 5 cargos aprovadores", min_values=0, max_values=5)
+    async def callback(self, interaction):
+        update_config(interaction.guild.id, self.system, approver_role_ids=[r.id for r in self.values])
+        await interaction.response.send_message("✅ Cargos aprovadores atualizados.", ephemeral=True)
+
+
+class LogChannelSelect(discord.ui.ChannelSelect):
+    def __init__(self, system):
+        self.system = system
+        super().__init__(placeholder="Selecione o canal de logs", channel_types=[discord.ChannelType.text], min_values=1, max_values=1)
+    async def callback(self, interaction):
+        update_config(interaction.guild.id, self.system, log_channel_id=self.values[0].id)
+        await interaction.response.send_message("✅ Canal de logs atualizado.", ephemeral=True)
+
+
+class SingleRoleSelect(discord.ui.RoleSelect):
+    def __init__(self, system, field, placeholder):
+        self.system = system
+        self.field = field
+        super().__init__(placeholder=placeholder, min_values=1, max_values=1)
+    async def callback(self, interaction):
+        update_config(interaction.guild.id, self.system, **{self.field: self.values[0].id})
+        await interaction.response.send_message("✅ Cargo atualizado.", ephemeral=True)
+
+
+class URLModal(discord.ui.Modal, title="Configurar URL da Embed"):
+    url = discord.ui.TextInput(label="URL da imagem", placeholder="https://...", required=False, max_length=500)
+    def __init__(self, system):
+        super().__init__()
+        self.system = system
+    async def on_submit(self, interaction):
+        update_config(interaction.guild.id, self.system, embed_url=str(self.url).strip())
+        await interaction.response.send_message("✅ URL atualizada.", ephemeral=True)
+
+
+class NamePatternModal(discord.ui.Modal, title="Configurar Padrão de Nome"):
+    pattern = discord.ui.TextInput(label="Padrão", placeholder="{id} | {nome}", max_length=50)
+    async def on_submit(self, interaction):
+        value = str(self.pattern).strip()
+        if "{nome}" not in value:
+            return await interaction.response.send_message("❌ O padrão precisa conter `{nome}`.", ephemeral=True)
+        update_config(interaction.guild.id, "registro", name_pattern=value)
+        await interaction.response.send_message("✅ Padrão atualizado.", ephemeral=True)
+
+
+class LaundryRateModal(discord.ui.Modal, title="Taxa de Lavagem"):
+    rate = discord.ui.TextInput(label="Taxa (%)", placeholder="25", max_length=8)
+    async def on_submit(self, interaction):
+        try:
+            rate = float(str(self.rate).replace(",", "."))
+            if not 0 <= rate <= 100: raise ValueError
+        except ValueError:
+            return await interaction.response.send_message("❌ Taxa inválida.", ephemeral=True)
+        update_config(interaction.guild.id, "lavagem", laundry_rate=rate)
+        await interaction.response.send_message("✅ Taxa atualizada.", ephemeral=True)
+
+
+class PartnerDiscountModal(discord.ui.Modal, title="Desconto de Parceria"):
+    discount = discord.ui.TextInput(label="Desconto (%)", placeholder="10", max_length=8)
+    async def on_submit(self, interaction):
+        try:
+            rate = float(str(self.discount).replace(",", "."))
+            if not 0 <= rate <= 100: raise ValueError
+        except ValueError:
+            return await interaction.response.send_message("❌ Desconto inválido.", ephemeral=True)
+        update_config(interaction.guild.id, "vendas", partner_discount=rate)
+        await interaction.response.send_message("✅ Desconto atualizado.", ephemeral=True)
+
+
+class ProductModal(discord.ui.Modal, title="Adicionar Produto"):
+    name = discord.ui.TextInput(label="Nome do produto", placeholder="Ex: Produto A", max_length=80)
+    price = discord.ui.TextInput(label="Preço unitário", placeholder="Ex: 90000", max_length=20)
+    async def on_submit(self, interaction):
+        try:
+            price = parse_money(self.price)
+            if price < 0: raise ValueError
+        except ValueError:
+            return await interaction.response.send_message("❌ Preço inválido.", ephemeral=True)
+        cfg = get_config(interaction.guild.id, "vendas")
+        products = [p for p in cfg.get("products", []) if p.get("name", "").lower() != str(self.name).lower()]
+        products.append({"name": str(self.name), "price": price})
+        update_config(interaction.guild.id, "vendas", products=products)
+        await interaction.response.send_message(f"✅ Produto **{self.name}** adicionado.", ephemeral=True)
+
+
+class WelcomeMessageModal(discord.ui.Modal, title="Mensagem de Boas Vindas"):
+    message = discord.ui.TextInput(
+        label="Mensagem",
+        placeholder="Bem-vindo(a), {membro}!",
+        style=discord.TextStyle.paragraph,
+        max_length=1000,
+    )
+    async def on_submit(self, interaction):
+        update_config(interaction.guild.id, "boas_vindas", welcome_message=str(self.message))
+        await interaction.response.send_message("✅ Mensagem de boas-vindas atualizada.", ephemeral=True)
+
+
+
+class GenericChannelSelect(discord.ui.ChannelSelect):
+    def __init__(self, system, field, placeholder):
+        self.system = system
+        self.field = field
+        super().__init__(
+            placeholder=placeholder,
+            channel_types=[discord.ChannelType.text],
+            min_values=1,
+            max_values=1
+        )
+
+    async def callback(self, interaction):
+        update_config(
+            interaction.guild.id,
+            self.system,
+            **{self.field: self.values[0].id}
+        )
+        await interaction.response.send_message("✅ Canal atualizado.", ephemeral=True)
+
+
+class MultiRoleFieldSelect(discord.ui.RoleSelect):
+    def __init__(self, system, field, placeholder, max_values=10):
+        self.system = system
+        self.field = field
+        super().__init__(
+            placeholder=placeholder,
+            min_values=0,
+            max_values=max_values
+        )
+
+    async def callback(self, interaction):
+        update_config(
+            interaction.guild.id,
+            self.system,
+            **{self.field: [r.id for r in self.values]}
+        )
+        await interaction.response.send_message("✅ Cargos atualizados.", ephemeral=True)
+
+
+class RankingPointsModal(discord.ui.Modal, title="Configurar Pontuação"):
+    sale_points = discord.ui.TextInput(
+        label="Pontos por venda",
+        placeholder="2",
+        max_length=6
+    )
+    register_points = discord.ui.TextInput(
+        label="Pontos por registro aprovado",
+        placeholder="5",
+        max_length=6
+    )
+    farm_divisor = discord.ui.TextInput(
+        label="Divisor do Farm",
+        placeholder="100 = 1 ponto a cada 100 itens",
+        max_length=8
+    )
+
+    async def on_submit(self, interaction):
+        try:
+            sale = int(str(self.sale_points))
+            reg = int(str(self.register_points))
+            divisor = int(str(self.farm_divisor))
+            if sale < 0 or reg < 0 or divisor <= 0:
+                raise ValueError
+        except ValueError:
+            return await interaction.response.send_message(
+                "❌ Valores inválidos.",
+                ephemeral=True
+            )
+
+        update_config(
+            interaction.guild.id,
+            "ranking",
+            sale_points=sale,
+            register_points=reg,
+            farm_points_divisor=divisor
+        )
+        await interaction.response.send_message("✅ Pontuação atualizada.", ephemeral=True)
+
+
+class SecurityLimitsModal(discord.ui.Modal, title="Limites de Segurança"):
+    spam_count = discord.ui.TextInput(label="Mensagens para detectar spam", placeholder="6", max_length=4)
+    spam_window = discord.ui.TextInput(label="Janela do spam (segundos)", placeholder="5", max_length=4)
+    spam_timeout = discord.ui.TextInput(label="Timeout aplicado (segundos)", placeholder="45", max_length=5)
+    raid_count = discord.ui.TextInput(label="Entradas para detectar raid", placeholder="10", max_length=4)
+    raid_window = discord.ui.TextInput(label="Janela do raid (segundos)", placeholder="15", max_length=4)
+
+    async def on_submit(self, interaction):
+        try:
+            values = [int(str(x)) for x in (
+                self.spam_count, self.spam_window, self.spam_timeout,
+                self.raid_count, self.raid_window
+            )]
+            if any(v <= 0 for v in values):
+                raise ValueError
+        except ValueError:
+            return await interaction.response.send_message("❌ Valores inválidos.", ephemeral=True)
+
+        update_config(
+            interaction.guild.id,
+            "seguranca",
+            spam_count=values[0],
+            spam_window=values[1],
+            spam_timeout=values[2],
+            raid_count=values[3],
+            raid_window=values[4]
+        )
+        await interaction.response.send_message("✅ Limites de segurança atualizados.", ephemeral=True)
+
+
+class BotStatusModal(discord.ui.Modal, title="Alterar Status do Bot"):
+    status = discord.ui.TextInput(label="Status", placeholder="Gerenciando a facção", max_length=100)
+
+    async def on_submit(self, interaction):
+        await bot.change_presence(activity=discord.Game(name=str(self.status)))
+        await interaction.response.send_message("✅ Status atualizado.", ephemeral=True)
+
+
+class BotNicknameModal(discord.ui.Modal, title="Alterar Nome no Servidor"):
+    nickname = discord.ui.TextInput(label="Nome do bot", placeholder="Bot Facção", max_length=32)
+
+    async def on_submit(self, interaction):
+        try:
+            await interaction.guild.me.edit(nick=str(self.nickname))
+            await interaction.response.send_message("✅ Nome do bot atualizado neste servidor.", ephemeral=True)
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                "❌ Não consegui alterar meu nome. Verifique minhas permissões.",
+                ephemeral=True
+            )
+
+
+class SimpleEmbedModal(discord.ui.Modal, title="Criar Embed"):
+    titulo = discord.ui.TextInput(label="Título", max_length=200)
+    descricao = discord.ui.TextInput(
+        label="Descrição",
+        style=discord.TextStyle.paragraph,
+        max_length=3500
+    )
+
+    async def on_submit(self, interaction):
+        await interaction.response.send_message(
+            "Escolha o canal onde deseja enviar:",
+            view=EmbedTargetChannelView(str(self.titulo), str(self.descricao)),
+            ephemeral=True
+        )
+
+
+class EmbedTargetSelect(discord.ui.ChannelSelect):
+    def __init__(self, title, description):
+        self.title_text = title
+        self.description_text = description
+        super().__init__(
+            placeholder="Selecione o canal",
+            channel_types=[discord.ChannelType.text],
+            min_values=1,
+            max_values=1
+        )
+
+    async def callback(self, interaction):
+        selected = self.values[0]
+        ch = interaction.guild.get_channel(int(selected.id))
+        if ch is None:
+            try:
+                ch = await interaction.guild.fetch_channel(int(selected.id))
+            except Exception:
+                ch = None
+        if not isinstance(ch, discord.TextChannel):
+            return await interaction.response.send_message("❌ Canal inválido.", ephemeral=True)
+
+        await ch.send(embed=embed(self.title_text, self.description_text))
+        await interaction.response.send_message(f"✅ Embed enviada em {ch.mention}.", ephemeral=True)
+
+
+class EmbedTargetChannelView(discord.ui.View):
+    def __init__(self, title, description):
+        super().__init__(timeout=120)
+        self.add_item(EmbedTargetSelect(title, description))
+
+
+class AnnouncementModal(discord.ui.Modal, title="Anúncio no Privado"):
+    titulo = discord.ui.TextInput(label="Título", max_length=200)
+    mensagem = discord.ui.TextInput(label="Mensagem", style=discord.TextStyle.paragraph, max_length=1800)
+
+    def __init__(self, role_id):
+        super().__init__()
+        self.role_id = int(role_id)
+
+    async def on_submit(self, interaction):
+        role = interaction.guild.get_role(self.role_id)
+        if not role:
+            return await interaction.response.send_message("❌ Cargo não encontrado.", ephemeral=True)
+
+        await interaction.response.defer(ephemeral=True)
+        sent = 0
+        failed = 0
+        e = embed(str(self.titulo), str(self.mensagem))
+
+        for member in role.members:
+            if member.bot:
+                continue
+            try:
+                await member.send(embed=e)
+                sent += 1
+                await asyncio.sleep(0.25)
+            except Exception:
+                failed += 1
+
+        await interaction.followup.send(
+            f"✅ Enviados: **{sent}**\n❌ Falhas/DM fechada: **{failed}**",
+            ephemeral=True
+        )
+
+
+class AnnouncementRoleSelect(discord.ui.RoleSelect):
+    def __init__(self):
+        super().__init__(placeholder="Selecione o cargo alvo", min_values=1, max_values=1)
+
+    async def callback(self, interaction):
+        await interaction.response.send_modal(AnnouncementModal(self.values[0].id))
+
+
+class AnnouncementRoleView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=120)
+        self.add_item(AnnouncementRoleSelect())
+
+
+class PurgeAmountModal(discord.ui.Modal, title="Limpar Mensagens"):
+    quantidade = discord.ui.TextInput(label="Quantidade", placeholder="20", max_length=3)
+
+    def __init__(self, channel_id):
+        super().__init__()
+        self.channel_id = int(channel_id)
+
+    async def on_submit(self, interaction):
+        try:
+            qty = int(str(self.quantidade))
+            if qty <= 0 or qty > 100:
+                raise ValueError
+        except ValueError:
+            return await interaction.response.send_message("❌ Use um número de 1 a 100.", ephemeral=True)
+
+        ch = interaction.guild.get_channel(self.channel_id)
+        if not isinstance(ch, discord.TextChannel):
+            return await interaction.response.send_message("❌ Canal inválido.", ephemeral=True)
+
+        try:
+            deleted = await ch.purge(limit=qty)
+            await interaction.response.send_message(
+                f"✅ **{len(deleted)}** mensagens removidas em {ch.mention}.",
+                ephemeral=True
+            )
+        except discord.Forbidden:
+            await interaction.response.send_message("❌ Sem permissão para limpar esse canal.", ephemeral=True)
+
+
+class PurgeChannelSelect(discord.ui.ChannelSelect):
+    def __init__(self):
+        super().__init__(
+            placeholder="Escolha o canal",
+            channel_types=[discord.ChannelType.text],
+            min_values=1,
+            max_values=1
+        )
+
+    async def callback(self, interaction):
+        await interaction.response.send_modal(PurgeAmountModal(self.values[0].id))
+
+
+class PurgeChannelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=120)
+        self.add_item(PurgeChannelSelect())
+
+
+async def ranking_embed_for_guild(guild):
+    conn = connect()
+    rows = conn.execute(
+        "SELECT user_id,pontos FROM pontos WHERE guild_id=? ORDER BY pontos DESC LIMIT 15",
+        (guild.id,)
+    ).fetchall()
+    conn.close()
+    lines = [f"**{i+1}.** <@{r['user_id']}> — **{r['pontos']} pts**" for i, r in enumerate(rows)]
+    return embed("🏆 Ranking Geral", "\n".join(lines) or "Sem pontuação registrada.", guild_id=guild.id)
+
+
+async def hierarchy_embed_for_guild(guild):
+    cfg = get_config(guild.id, "hierarquia")
+    role_ids = cfg.get("hierarchy_role_ids", [])
+    roles = [guild.get_role(int(rid)) for rid in role_ids]
+    roles = [r for r in roles if r]
+
+    if not roles:
+        return embed(
+            "🏰 Hierarquia",
+            "Nenhum cargo foi configurado ainda.\nUse `/gerenciar` → Hierarquia → Configurações Específicas.",
+            guild_id=guild.id
+        )
+
+    lines = []
+    for role in roles:
+        members = [m.mention for m in role.members[:12]]
+        value = ", ".join(members) if members else "Nenhum membro"
+        if len(role.members) > 12:
+            value += f" e +{len(role.members)-12}"
+        lines.append(f"**{role.mention}**\n{value}")
+
+    return embed("🏰 Hierarquia da Organização", "\n\n".join(lines), guild_id=guild.id)
+
+
+class HierarquiaPanel(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="Atualizar Hierarquia",
+        emoji="🏰",
+        style=discord.ButtonStyle.secondary,
+        custom_id="public:hierarquia:refresh"
+    )
+    async def refresh(self, interaction, button):
+        await interaction.response.edit_message(
+            embed=await hierarchy_embed_for_guild(interaction.guild),
+            view=self
+        )
+
+
+class RankingPublicPanel(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="Atualizar Ranking",
+        emoji="🏆",
+        style=discord.ButtonStyle.secondary,
+        custom_id="public:ranking:refresh"
+    )
+    async def refresh(self, interaction, button):
+        await interaction.response.edit_message(
+            embed=await ranking_embed_for_guild(interaction.guild),
+            view=self
+        )
+
+
+class BackupRestoreConfirm(discord.ui.View):
+    def __init__(self, author_id):
+        super().__init__(timeout=60)
+        self.author_id = int(author_id)
+
+    @discord.ui.button(label="Restaurar Configurações", emoji="⚠️", style=discord.ButtonStyle.danger)
+    async def restore(self, interaction, button):
+        if interaction.user.id != self.author_id:
+            return await deny(interaction)
+
+        path = BACKUP_DIR / f"{interaction.guild.id}.json"
+        if not path.exists():
+            return await interaction.response.send_message("❌ Nenhum backup encontrado.", ephemeral=True)
+
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            configs = data.get("configs", {})
+            for system, cfg in configs.items():
+                if system in SYSTEMS and isinstance(cfg, dict):
+                    save_config(interaction.guild.id, system, cfg)
+            await interaction.response.edit_message(
+                content="✅ Configurações restauradas a partir do último backup.",
+                view=None
+            )
+        except Exception as exc:
+            await interaction.response.edit_message(
+                content=f"❌ Falha ao restaurar: `{type(exc).__name__}`",
+                view=None
+            )
+
+
+
+class FarmItemAddModal(discord.ui.Modal, title="Adicionar Item de Farm"):
+    item_name = discord.ui.TextInput(
+        label="Nome do item",
+        placeholder="Ex: Munição, Cápsula, Pólvora...",
+        max_length=80
+    )
+
+    async def on_submit(self, interaction):
+        name = str(self.item_name).strip()
+        if not name:
+            return await interaction.response.send_message("❌ Informe um nome.", ephemeral=True)
+
+        cfg = get_config(interaction.guild.id, "farm")
+        items = [str(x) for x in cfg.get("farm_items", [])]
+        if name.lower() not in {x.lower() for x in items}:
+            items.append(name)
+        update_config(interaction.guild.id, "farm", farm_items=items[:25])
+
+        await interaction.response.send_message(
+            f"✅ **{name}** adicionado às opções de Farm.",
+            ephemeral=True
+        )
+
+
+class StockItemAddModal(discord.ui.Modal, title="Adicionar Item ao Baú"):
+    item_name = discord.ui.TextInput(
+        label="Nome do item",
+        placeholder="Ex: Munição, Kit, Material...",
+        max_length=80
+    )
+
+    async def on_submit(self, interaction):
+        name = str(self.item_name).strip()
+        if not name:
+            return await interaction.response.send_message("❌ Informe um nome.", ephemeral=True)
+
+        cfg = get_config(interaction.guild.id, "bau")
+        items = [str(x) for x in cfg.get("stock_items", [])]
+        if name.lower() not in {x.lower() for x in items}:
+            items.append(name)
+
+        update_config(interaction.guild.id, "bau", stock_items=items[:25])
+        await interaction.response.send_message(
+            f"✅ **{name}** adicionado às opções do Baú.",
+            ephemeral=True
+        )
+
+
+class ThemeColorModal(discord.ui.Modal, title="Cor Principal do Bot"):
+    color_hex = discord.ui.TextInput(
+        label="Cor HEX",
+        placeholder="#C89B3C",
+        max_length=7
+    )
+
+    async def on_submit(self, interaction):
+        raw = str(self.color_hex).strip()
+        normalized = raw if raw.startswith("#") else f"#{raw}"
+        try:
+            value = parse_hex_color(normalized)
+            if len(normalized.replace("#", "")) not in {3, 6}:
+                raise ValueError
+        except Exception:
+            return await interaction.response.send_message(
+                "❌ Cor inválida. Use algo como `#C89B3C`, `#5865F2` ou `#00FF88`.",
+                ephemeral=True
+            )
+
+        update_config(interaction.guild.id, "personalizacao", theme_color=normalized.upper())
+        await interaction.response.send_message(
+            embed=embed(
+                "🎨 Cor Atualizada",
+                f"A nova cor principal é **{normalized.upper()}**.",
+                value,
+                guild_id=interaction.guild.id
+            ),
+            ephemeral=True
+        )
+
+
+class MessageImageModal(discord.ui.Modal, title="Imagem das Mensagens"):
+    image_url = discord.ui.TextInput(
+        label="Banner dos painéis (URL)",
+        placeholder="https://...",
+        required=False,
+        max_length=500
+    )
+    thumbnail_url = discord.ui.TextInput(
+        label="Logo pequena / miniatura (URL)",
+        placeholder="https://...",
+        required=False,
+        max_length=500
+    )
+    footer_text = discord.ui.TextInput(
+        label="Texto do rodapé",
+        placeholder="Nome da facção • Bot Facção",
+        required=False,
+        max_length=200
+    )
+
+    async def on_submit(self, interaction):
+        image_url = str(self.image_url).strip()
+        thumb_url = str(self.thumbnail_url).strip()
+        footer = str(self.footer_text).strip()
+
+        for url in (image_url, thumb_url):
+            if url and not (url.startswith("http://") or url.startswith("https://")):
+                return await interaction.response.send_message(
+                    "❌ As imagens precisam usar uma URL começando com `http://` ou `https://`.",
+                    ephemeral=True
+                )
+
+        update_config(
+            interaction.guild.id,
+            "personalizacao",
+            message_image_url=image_url,
+            message_thumbnail_url=thumb_url,
+            message_footer_text=footer
+        )
+
+        await interaction.response.send_message(
+            embed=embed(
+                "🖼️ Aparência Atualizada",
+                "Imagem, miniatura e rodapé foram atualizados. A imagem grande será usada nos painéis principais.",
+                guild_id=interaction.guild.id,
+                use_theme_image=True,
+                use_theme_thumbnail=True
+            ),
+            ephemeral=True
+        )
+
+
+class ThemePreviewView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=60)
+
+    @discord.ui.button(label="Ver Painel de Exemplo", emoji="👁️", style=discord.ButtonStyle.secondary)
+    async def preview(self, interaction, button):
+        await interaction.response.send_message(
+            embed=embed(
+                "✨ Prévia do Tema",
+                "A imagem grande aparece nos painéis principais. Nas respostas menores fica apenas a miniatura.",
+                guild_id=interaction.guild.id,
+                use_theme_image=True,
+                use_theme_thumbnail=True
+            ),
+            ephemeral=True
+        )
+
+class SpecialOptionsView(discord.ui.View):
+    def __init__(self, system):
+        super().__init__(timeout=180)
+        self.system = system
+
+        if system == "boas_vindas":
+            self.add_item(SpecialActionButton(system, "welcome_message", "Mensagem", "💬"))
+            self.add_item(SpecialActionButton(system, "welcome_channel", "Canal Público", "📢"))
+            self.add_item(SpecialActionButton(system, "welcome_test", "Testar Boas-vindas", "🧪"))
+
+        elif system == "registro":
+            self.add_item(SpecialActionButton(system, "pattern", "Padrão de Nome", "🪪"))
+            self.add_item(SpecialActionButton(system, "approved_role", "Cargo Aprovado", "🎭"))
+            self.add_item(SpecialActionButton(system, "visitor_role", "Cargo Visitante", "🧳"))
+            self.add_item(SpecialActionButton(system, "visitor_toggle", "Ativar/Desativar Visitante", "🔄"))
+
+        elif system == "vendas":
+            self.add_item(SpecialActionButton(system, "product", "Adicionar Produto", "📦"))
+            self.add_item(SpecialActionButton(system, "products_list", "Ver Catálogo", "📋"))
+            self.add_item(SpecialActionButton(system, "products_clear", "Limpar Catálogo", "🗑️"))
+            self.add_item(SpecialActionButton(system, "discount", "Desconto Parceria", "🤝"))
+
+        elif system == "banco":
+            self.add_item(SpecialActionButton(system, "bank_summary", "Resumo do Banco", "🏦"))
+
+        elif system == "farm":
+            self.add_item(SpecialActionButton(system, "farm_add_item", "Adicionar Item", "➕"))
+            self.add_item(SpecialActionButton(system, "farm_items_list", "Ver Itens", "📋"))
+            self.add_item(SpecialActionButton(system, "farm_items_clear", "Limpar Itens", "🗑️"))
+            self.add_item(SpecialActionButton(system, "farm_rank", "Ver Ranking", "🏆"))
+            self.add_item(SpecialActionButton(system, "farm_pdf", "Gerar PDF", "📄"))
+
+        elif system == "acoes":
+            self.add_item(SpecialActionButton(system, "actions_open", "Ações Abertas", "🎯"))
+            self.add_item(SpecialActionButton(system, "actions_history", "Histórico", "📜"))
+            self.add_item(SpecialActionButton(system, "action_ping_role", "Cargo para Ping", "📣"))
+
+        elif system == "hierarquia":
+            self.add_item(SpecialActionButton(system, "hierarchy_roles", "Cargos da Hierarquia", "🏰"))
+            self.add_item(SpecialActionButton(system, "hierarchy_preview", "Prévia da Hierarquia", "👁️"))
+
+        elif system == "ausencia":
+            self.add_item(SpecialActionButton(system, "absence_pending", "Ver Pendentes", "⌛"))
+
+        elif system == "lavagem":
+            self.add_item(SpecialActionButton(system, "laundry", "Taxa de Lavagem", "📊"))
+
+        elif system == "encomendas":
+            self.add_item(SpecialActionButton(system, "orders_pending", "Ver Pendentes", "📦"))
+
+        elif system == "bau":
+            self.add_item(SpecialActionButton(system, "stock_add_item", "Adicionar Item", "➕"))
+            self.add_item(SpecialActionButton(system, "stock_items_list", "Ver Itens", "📋"))
+            self.add_item(SpecialActionButton(system, "stock_items_clear", "Limpar Itens", "🗑️"))
+            self.add_item(SpecialActionButton(system, "leader_roles", "Cargos de Líder", "👑"))
+            self.add_item(SpecialActionButton(system, "stock_preview", "Ver Estoque", "🧰"))
+
+        elif system == "advertencias":
+            self.add_item(SpecialActionButton(system, "warnings_summary", "Resumo de Advertências", "⚠️"))
+
+        elif system == "ranking":
+            self.add_item(SpecialActionButton(system, "ranking_points", "Configurar Pontos", "⚙️"))
+            self.add_item(SpecialActionButton(system, "ranking_preview", "Ver Ranking", "🏆"))
+
+        elif system == "logs":
+            self.add_item(SpecialActionButton(system, "logs_test", "Testar Canal de Logs", "🧪"))
+
+        elif system == "seguranca":
+            self.add_item(SpecialActionButton(system, "security_limits", "Limites de Segurança", "🛡️"))
+
+        elif system == "backup":
+            self.add_item(SpecialActionButton(system, "create_backup", "Criar Backup Agora", "💾"))
+            self.add_item(SpecialActionButton(system, "restore_backup", "Restaurar Configurações", "♻️"))
+
+        elif system == "personalizacao":
+            self.add_item(SpecialActionButton(system, "theme_color", "Cor Principal", "🎨"))
+            self.add_item(SpecialActionButton(system, "message_image", "Imagem das Mensagens", "🖼️"))
+            self.add_item(SpecialActionButton(system, "theme_preview", "Prévia do Tema", "👁️"))
+            self.add_item(SpecialActionButton(system, "bot_status", "Status do Bot", "🎮"))
+            self.add_item(SpecialActionButton(system, "bot_nickname", "Nome no Servidor", "✏️"))
+
+        elif system == "utilidades":
+            self.add_item(SpecialActionButton(system, "embed_creator", "Criador de Embed", "🎨"))
+            self.add_item(SpecialActionButton(system, "dm_announcement", "Anúncio Privado", "📢"))
+            self.add_item(SpecialActionButton(system, "purge_messages", "Limpar Mensagens", "🧹"))
+
+
+class SpecialActionButton(discord.ui.Button):
+    def __init__(self, system, action, label, emoji):
+        super().__init__(label=label, emoji=emoji, style=discord.ButtonStyle.secondary)
+        self.system = system
+        self.action = action
+
+    async def callback(self, interaction):
+        if not is_admin(interaction.user):
+            return await deny(interaction)
+
+        action = self.action
+
+        if action == "pattern":
+            return await interaction.response.send_modal(NamePatternModal())
+
+        if action == "approved_role":
+            v = discord.ui.View(timeout=120)
+            v.add_item(SingleRoleSelect("registro", "approved_role_id", "Selecione o cargo pós-aprovação"))
+            return await interaction.response.send_message("Escolha o cargo:", view=v, ephemeral=True)
+
+        if action == "visitor_role":
+            v = discord.ui.View(timeout=120)
+            v.add_item(SingleRoleSelect("registro", "visitor_role_id", "Selecione o cargo visitante"))
+            return await interaction.response.send_message("Escolha o cargo:", view=v, ephemeral=True)
+
+        if action == "visitor_toggle":
+            cfg = get_config(interaction.guild.id, "registro")
+            update_config(
+                interaction.guild.id,
+                "registro",
+                visitor_enabled=not cfg.get("visitor_enabled")
+            )
+            return await interaction.response.send_message("✅ Visitante atualizado.", ephemeral=True)
+
+        if action == "product":
+            return await interaction.response.send_modal(ProductModal())
+
+        if action == "products_list":
+            cfg = get_config(interaction.guild.id, "vendas")
+            products = cfg.get("products", [])
+            lines = [
+                f"**{i+1}. {p.get('name', 'Produto')}** — {money(float(p.get('price', 0)))}"
+                for i, p in enumerate(products)
+            ]
+            return await interaction.response.send_message(
+                embed=embed("📋 Catálogo de Produtos", "\n".join(lines) or "Nenhum produto cadastrado.", guild_id=interaction.guild.id),
+                ephemeral=True
+            )
+
+        if action == "products_clear":
+            update_config(interaction.guild.id, "vendas", products=[])
+            return await interaction.response.send_message("✅ Catálogo limpo.", ephemeral=True)
+
+        if action == "discount":
+            return await interaction.response.send_modal(PartnerDiscountModal())
+
+        if action == "laundry":
+            return await interaction.response.send_modal(LaundryRateModal())
+
+        if action == "welcome_message":
+            return await interaction.response.send_modal(WelcomeMessageModal())
+
+        if action == "welcome_channel":
+            v = discord.ui.View(timeout=120)
+            v.add_item(GenericChannelSelect("boas_vindas", "welcome_channel_id", "Selecione o canal público"))
+            return await interaction.response.send_message("Escolha o canal:", view=v, ephemeral=True)
+
+        if action == "welcome_test":
+            cfg = get_config(interaction.guild.id, "boas_vindas")
+            msg = str(cfg.get("welcome_message", "Bem-vindo(a), {membro}!"))
+            msg = msg.replace("{membro}", interaction.user.mention).replace("{servidor}", interaction.guild.name)
+            return await interaction.response.send_message(
+                embed=embed("🏠 Teste de Boas-vindas", msg, GREEN, cfg.get("embed_url", ""), guild_id=interaction.guild.id),
+                ephemeral=True
+            )
+
+        if action == "bank_summary":
+            conn = connect()
+            rows = conn.execute(
+                "SELECT tipo,valor FROM banco WHERE guild_id=?",
+                (interaction.guild.id,)
+            ).fetchall()
+            conn.close()
+            entradas = sum(float(r["valor"]) for r in rows if r["tipo"] == "entrada")
+            saidas = sum(float(r["valor"]) for r in rows if r["tipo"] == "saida")
+            return await interaction.response.send_message(
+                embed=embed(
+                    "🏦 Resumo do Banco",
+                    f"**Entradas:** {money(entradas)}\n**Saídas:** {money(saidas)}\n**Saldo:** {money(entradas-saidas)}"
+                ),
+                ephemeral=True
+            )
+
+        if action == "farm_add_item":
+            return await interaction.response.send_modal(FarmItemAddModal())
+
+        if action == "farm_items_list":
+            cfg = get_config(interaction.guild.id, "farm")
+            items = cfg.get("farm_items", [])
+            lines = [f"**{i+1}.** {item}" for i, item in enumerate(items)]
+            return await interaction.response.send_message(
+                embed=embed(
+                    "📋 Itens disponíveis no Farm",
+                    "\n".join(lines) or "Nenhum item cadastrado.",
+                    guild_id=interaction.guild.id
+                ),
+                ephemeral=True
+            )
+
+        if action == "farm_items_clear":
+            update_config(interaction.guild.id, "farm", farm_items=[])
+            return await interaction.response.send_message(
+                "✅ Lista de itens do Farm limpa.",
+                ephemeral=True
+            )
+
+        if action == "farm_rank":
+            conn = connect()
+            rows = conn.execute(
+                """SELECT user_id,SUM(quantidade) total FROM farms
+                   WHERE guild_id=? AND status='aprovado'
+                   GROUP BY user_id ORDER BY total DESC LIMIT 15""",
+                (interaction.guild.id,)
+            ).fetchall()
+            conn.close()
+            lines = [f"**{i+1}.** <@{r['user_id']}> — **{r['total']}**" for i, r in enumerate(rows)]
+            return await interaction.response.send_message(
+                embed=embed("🏆 Ranking de Farm", "\n".join(lines) or "Sem farms aprovados.", guild_id=interaction.guild.id),
+                ephemeral=True
+            )
+
+        if action == "farm_pdf":
+            await interaction.response.defer(ephemeral=True)
+            conn = connect()
+            rows = conn.execute(
+                "SELECT user_id,item,quantidade,status,created_at FROM farms WHERE guild_id=? ORDER BY id DESC LIMIT 500",
+                (interaction.guild.id,)
+            ).fetchall()
+            conn.close()
+            lines = [
+                f"{r['created_at'][:10]} | {r['user_id']} | {r['item']} | {r['quantidade']} | {r['status']}"
+                for r in rows
+            ]
+            return await interaction.followup.send(
+                file=discord.File(simple_pdf(f"Relatorio de Farm - {FAC_NAME}", lines), filename="relatorio_farm.pdf"),
+                ephemeral=True
+            )
+
+        if action == "actions_open":
+            return await interaction.response.send_message(
+                embed=build_actions_list_embed(interaction.guild, only_open=True),
+                view=ActionBrowserView(interaction.guild.id, only_open=True),
+                ephemeral=True
+            )
+
+        if action == "actions_history":
+            return await interaction.response.send_message(
+                embed=build_actions_list_embed(interaction.guild, only_open=False),
+                view=ActionBrowserView(interaction.guild.id, only_open=False),
+                ephemeral=True
+            )
+
+        if action == "action_ping_role":
+            v = discord.ui.View(timeout=120)
+            v.add_item(SingleRoleSelect("acoes", "action_ping_role_id", "Selecione o cargo para ping"))
+            return await interaction.response.send_message("Escolha o cargo:", view=v, ephemeral=True)
+
+        if action == "hierarchy_roles":
+            v = discord.ui.View(timeout=120)
+            v.add_item(MultiRoleFieldSelect("hierarquia", "hierarchy_role_ids", "Selecione os cargos da hierarquia", 10))
+            return await interaction.response.send_message("Escolha os cargos:", view=v, ephemeral=True)
+
+        if action == "hierarchy_preview":
+            return await interaction.response.send_message(
+                embed=await hierarchy_embed_for_guild(interaction.guild),
+                ephemeral=True
+            )
+
+        if action == "absence_pending":
+            conn = connect()
+            rows = conn.execute(
+                "SELECT user_id,periodo,motivo FROM ausencias WHERE guild_id=? AND status='pendente' ORDER BY id DESC LIMIT 15",
+                (interaction.guild.id,)
+            ).fetchall()
+            conn.close()
+            lines = [f"<@{r['user_id']}> • **{r['periodo']}**\n{r['motivo']}" for r in rows]
+            return await interaction.response.send_message(
+                embed=embed("⌛ Ausências Pendentes", "\n\n".join(lines) or "Nenhuma solicitação pendente.", guild_id=interaction.guild.id),
+                ephemeral=True
+            )
+
+        if action == "orders_pending":
+            conn = connect()
+            rows = conn.execute(
+                """SELECT responsavel_id,descricao,data_hora,destinatario
+                   FROM encomendas WHERE guild_id=? AND status='pendente'
+                   ORDER BY id DESC LIMIT 15""",
+                (interaction.guild.id,)
+            ).fetchall()
+            conn.close()
+            lines = [
+                f"**Responsável:** <@{r['responsavel_id']}>\n**Data:** {r['data_hora']}\n**Destino:** {r['destinatario']}\n{r['descricao']}"
+                for r in rows
+            ]
+            return await interaction.response.send_message(
+                embed=embed("📦 Encomendas Pendentes", "\n\n".join(lines) or "Nenhuma encomenda pendente.", guild_id=interaction.guild.id),
+                ephemeral=True
+            )
+
+        if action == "stock_add_item":
+            return await interaction.response.send_modal(StockItemAddModal())
+
+        if action == "stock_items_list":
+            cfg = get_config(interaction.guild.id, "bau")
+            items = cfg.get("stock_items", [])
+            lines = [f"**{i+1}.** {item}" for i, item in enumerate(items)]
+            return await interaction.response.send_message(
+                embed=embed(
+                    "📋 Itens do Baú",
+                    "\n".join(lines) or "Nenhum item configurado.",
+                    guild_id=interaction.guild.id
+                ),
+                ephemeral=True
+            )
+
+        if action == "stock_items_clear":
+            update_config(interaction.guild.id, "bau", stock_items=[])
+            return await interaction.response.send_message("✅ Lista de itens do Baú limpa.", ephemeral=True)
+
+        if action == "leader_roles":
+            v = discord.ui.View(timeout=120)
+            v.add_item(MultiRoleFieldSelect("bau", "leader_role_ids", "Selecione cargos de líder", 5))
+            return await interaction.response.send_message("Escolha os cargos:", view=v, ephemeral=True)
+
+        if action == "stock_preview":
+            conn = connect()
+            rows = conn.execute(
+                "SELECT bau,item,quantidade FROM estoque WHERE guild_id=? ORDER BY bau,item",
+                (interaction.guild.id,)
+            ).fetchall()
+            conn.close()
+            lines = [f"`{r['bau'].upper():5}` **{r['item']}** — {r['quantidade']}" for r in rows[:40]]
+            return await interaction.response.send_message(
+                embed=embed("🧰 Estoque Atual", "\n".join(lines) or "Estoque vazio.", guild_id=interaction.guild.id),
+                ephemeral=True
+            )
+
+        if action == "warnings_summary":
+            conn = connect()
+            rows = conn.execute(
+                """SELECT user_id,COUNT(*) total,SUM(pontos) pontos
+                   FROM advertencias WHERE guild_id=?
+                   GROUP BY user_id ORDER BY pontos DESC LIMIT 15""",
+                (interaction.guild.id,)
+            ).fetchall()
+            conn.close()
+            lines = [
+                f"<@{r['user_id']}> — **{r['total']} advertência(s)** • **{r['pontos'] or 0} ponto(s)**"
+                for r in rows
+            ]
+            return await interaction.response.send_message(
+                embed=embed("⚠️ Resumo de Advertências", "\n".join(lines) or "Nenhuma advertência registrada.", guild_id=interaction.guild.id),
+                ephemeral=True
+            )
+
+        if action == "ranking_points":
+            return await interaction.response.send_modal(RankingPointsModal())
+
+        if action == "ranking_preview":
+            return await interaction.response.send_message(
+                embed=await ranking_embed_for_guild(interaction.guild),
+                ephemeral=True
+            )
+
+        if action == "logs_test":
+            await log_event(
+                interaction.guild,
+                "logs",
+                "🧪 Teste de Logs",
+                f"Teste realizado por {interaction.user.mention}.",
+                GREEN
+            )
+            return await interaction.response.send_message(
+                "✅ Teste enviado ao canal configurado em Logs.",
+                ephemeral=True
+            )
+
+        if action == "security_limits":
+            return await interaction.response.send_modal(SecurityLimitsModal())
+
+        if action == "create_backup":
+            path = await create_backup(interaction.guild)
+            return await interaction.response.send_message(
+                "✅ Backup criado.",
+                file=discord.File(path),
+                ephemeral=True
+            )
+
+        if action == "restore_backup":
+            path = BACKUP_DIR / f"{interaction.guild.id}.json"
+            if not path.exists():
+                return await interaction.response.send_message("❌ Nenhum backup encontrado.", ephemeral=True)
+            return await interaction.response.send_message(
+                "⚠️ Restaurar as configurações salvas no último backup?",
+                view=BackupRestoreConfirm(interaction.user.id),
+                ephemeral=True
+            )
+
+        if action == "theme_color":
+            return await interaction.response.send_modal(ThemeColorModal())
+
+        if action == "message_image":
+            return await interaction.response.send_modal(MessageImageModal())
+
+        if action == "theme_preview":
+            return await interaction.response.send_message(
+                "Prévia atual do tema:",
+                view=ThemePreviewView(),
+                ephemeral=True
+            )
+
+        if action == "bot_status":
+            return await interaction.response.send_modal(BotStatusModal())
+
+        if action == "bot_nickname":
+            return await interaction.response.send_modal(BotNicknameModal())
+
+        if action == "embed_creator":
+            return await interaction.response.send_modal(SimpleEmbedModal())
+
+        if action == "dm_announcement":
+            return await interaction.response.send_message(
+                "Escolha o cargo que receberá o anúncio:",
+                view=AnnouncementRoleView(),
+                ephemeral=True
+            )
+
+        if action == "purge_messages":
+            return await interaction.response.send_message(
+                "Escolha o canal que deseja limpar:",
+                view=PurgeChannelView(),
+                ephemeral=True
+            )
+
+        await interaction.response.send_message("✅ Opção executada.", ephemeral=True)
+
+
+class PanelChannelSelect(discord.ui.ChannelSelect):
+    def __init__(self, system):
+        self.system = system
+        super().__init__(
+            placeholder="Escolha o canal do painel",
+            channel_types=[discord.ChannelType.text],
+            min_values=1,
+            max_values=1
+        )
+
+    async def callback(self, interaction):
+        # ChannelSelect pode retornar um AppCommandChannel.
+        # Ele tem ID/mention, mas NÃO possui o método .send().
+        selected = self.values[0]
+        channel_id = int(selected.id)
+
+        # Resolve o ID para um canal real do servidor.
+        ch = interaction.guild.get_channel(channel_id)
+        if ch is None:
+            try:
+                ch = await interaction.guild.fetch_channel(channel_id)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                ch = None
+
+        if not isinstance(ch, discord.TextChannel):
+            return await interaction.response.send_message(
+                "❌ Não consegui acessar esse canal de texto. "
+                "Verifique se o bot possui **Ver Canal** e **Enviar Mensagens**.",
+                ephemeral=True
+            )
+
+        try:
+            await send_public_panel(interaction.guild, ch, self.system)
+        except discord.Forbidden:
+            return await interaction.response.send_message(
+                "❌ Não tenho permissão para enviar mensagens nesse canal.",
+                ephemeral=True
+            )
+        except discord.HTTPException as e:
+            return await interaction.response.send_message(
+                f"❌ O Discord recusou o envio do painel (`HTTP {e.status}`).",
+                ephemeral=True
+            )
+
+        update_config(
+            interaction.guild.id,
+            self.system,
+            public_channel_id=channel_id
+        )
+
+        await interaction.response.send_message(
+            f"✅ Painel enviado em {ch.mention}.",
+            ephemeral=True
+        )
+
+
+class PanelChannelView(discord.ui.View):
+    def __init__(self, system):
+        super().__init__(timeout=120)
+        self.add_item(PanelChannelSelect(system))
+
+# ============================================================
+# PAINÉIS PÚBLICOS
+# ============================================================
+
+async def send_public_panel(guild, channel, system):
+    meta = SYSTEMS[system]
+    cfg = get_config(guild.id, system)
+    e = embed(
+        meta["public_title"],
+        meta["public_description"],
+        None,
+        cfg.get("embed_url", ""),
+        guild_id=guild.id,
+        use_theme_image=True,
+        use_theme_thumbnail=True
+    )
+    e.add_field(
+        name="Status",
+        value="🟢 Sistema disponível" if cfg["enabled"] else "🔴 Sistema indisponível",
+        inline=False
+    )
+
+    view_map = {
+        "registro": RegistroPanel(),
+        "vendas": VendasPanel(),
+        "banco": BancoPanel(),
+        "lavagem": LavagemPanel(),
+        "encomendas": EncomendasPanel(),
+        "ausencia": AusenciaPanel(),
+        "farm": FarmPanel(),
+        "bau": BauPanel(),
+        "acoes": AcoesPanel(),
+        "hierarquia": HierarquiaPanel(),
+        "ranking": RankingPublicPanel(),
+    }
+    if system == "hierarquia":
+        e = await hierarchy_embed_for_guild(guild)
+    elif system == "ranking":
+        e = await ranking_embed_for_guild(guild)
+
+    await channel.send(embed=e, view=view_map[system])
+
+# ============================================================
+# REGISTRO
+# ============================================================
+
+class RegistroModal(discord.ui.Modal, title="Realizar Registro"):
+    nome = discord.ui.TextInput(label="Nome", placeholder="Nome do personagem", max_length=80)
+    identificacao = discord.ui.TextInput(label="ID / Passaporte", placeholder="Ex: 123", max_length=30)
+    telefone = discord.ui.TextInput(label="Telefone", required=False, max_length=40)
+    recrutador = discord.ui.TextInput(label="Recrutador", required=False, max_length=80)
+
+    async def on_submit(self, interaction):
+        if not enabled(interaction.guild.id, "registro"):
+            return await interaction.response.send_message("❌ Sistema de registro está desligado.", ephemeral=True)
+
+        conn = connect()
+        cur = conn.cursor()
+        cur.execute(
+            """INSERT INTO registros(guild_id,user_id,nome,identificacao,telefone,recrutador,status,created_at)
+               VALUES(?,?,?,?,?,?,'pendente',?)""",
+            (
+                interaction.guild.id, interaction.user.id, str(self.nome), str(self.identificacao),
+                str(self.telefone), str(self.recrutador), now_iso()
+            )
+        )
+        rid = cur.lastrowid
+        conn.commit()
+        conn.close()
+
+        e = embed("👤 Novo Registro", "Aguardando aprovação.")
+        e.add_field(name="Usuário", value=interaction.user.mention, inline=False)
+        e.add_field(name="Nome", value=str(self.nome), inline=True)
+        e.add_field(name="ID", value=str(self.identificacao), inline=True)
+        e.add_field(name="Telefone", value=str(self.telefone) or "Não informado", inline=True)
+        e.add_field(name="Recrutador", value=str(self.recrutador) or "Não informado", inline=True)
+        e.set_footer(text=f"REG#{rid} • {FOOTER}")
+
+        cfg = get_config(interaction.guild.id, "registro")
+        ch = interaction.guild.get_channel(int(cfg["log_channel_id"])) if cfg.get("log_channel_id") else None
+        if ch:
+            await ch.send(embed=e, view=ApprovalView("registro", rid, interaction.user.id))
+
+        await interaction.response.send_message("✅ Registro enviado para análise.", ephemeral=True)
+
+class RegistroPanel(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Realizar Registro", emoji="👤", style=discord.ButtonStyle.primary, custom_id="public:registro")
+    async def register(self, interaction, button):
+        await interaction.response.send_modal(RegistroModal())
+
+    @discord.ui.button(label="Entrar como Visitante", emoji="🧳", style=discord.ButtonStyle.secondary, custom_id="public:visitor")
+    async def visitor(self, interaction, button):
+        cfg = get_config(interaction.guild.id, "registro")
+        if not cfg.get("visitor_enabled") or not cfg.get("visitor_role_id"):
+            return await interaction.response.send_message("❌ Sistema de visitante está desativado.", ephemeral=True)
+        role = interaction.guild.get_role(int(cfg["visitor_role_id"]))
+        if not role:
+            return await interaction.response.send_message("❌ Cargo visitante não encontrado.", ephemeral=True)
+        try:
+            await interaction.user.add_roles(role, reason="Acesso visitante")
+            await interaction.response.send_message("✅ Cargo de visitante aplicado.", ephemeral=True)
+        except discord.Forbidden:
+            await interaction.response.send_message("❌ Não consegui aplicar o cargo. Verifique a hierarquia.", ephemeral=True)
+
+# ============================================================
+# APROVAÇÃO GENÉRICA
+# ============================================================
+
+class ApprovalView(discord.ui.View):
+    def __init__(self, system, record_id, target_id):
+        super().__init__(timeout=None)
+        self.system = system
+        self.record_id = int(record_id)
+        self.target_id = int(target_id)
+
+    @discord.ui.button(label="Aprovar", emoji="✅", style=discord.ButtonStyle.success)
+    async def approve(self, interaction, button):
+        if not can_approve(interaction.user, self.system):
+            return await deny(interaction, "❌ Você não é aprovador deste sistema.")
+
+        await self.process(interaction, True)
+
+    @discord.ui.button(label="Reprovar", emoji="❌", style=discord.ButtonStyle.danger)
+    async def reject(self, interaction, button):
+        if not can_approve(interaction.user, self.system):
+            return await deny(interaction, "❌ Você não é aprovador deste sistema.")
+
+        await self.process(interaction, False)
+
+    async def process(self, interaction, approved):
+        status = "aprovado" if approved else "reprovado"
+        table = {
+            "registro": "registros",
+            "farm": "farms",
+            "ausencia": "ausencias",
+            "encomendas": "encomendas"
+        }[self.system]
+
+        conn = connect()
+        row = conn.execute(f"SELECT * FROM {table} WHERE id=?", (self.record_id,)).fetchone()
+        if not row or row["status"] != "pendente":
+            conn.close()
+            return await interaction.response.send_message("Esta solicitação já foi processada.", ephemeral=True)
+
+        conn.execute(
+            f"UPDATE {table} SET status=?, reviewer_id=? WHERE id=?",
+            (status, interaction.user.id, self.record_id)
+        )
+        conn.commit()
+        conn.close()
+
+        if self.system == "registro" and approved:
+            member = interaction.guild.get_member(self.target_id)
+            cfg = get_config(interaction.guild.id, "registro")
+            if member:
+                role = interaction.guild.get_role(int(cfg["approved_role_id"])) if cfg.get("approved_role_id") else None
+                try:
+                    if role:
+                        await member.add_roles(role, reason="Registro aprovado")
+                    pattern = cfg.get("name_pattern", "{id} | {nome}")
+                    nick = pattern.replace("{id}", str(row["identificacao"])).replace("{nome}", str(row["nome"]))[:32]
+                    await member.edit(nick=nick)
+                except discord.Forbidden:
+                    pass
+            rcfg = get_config(interaction.guild.id, "ranking")
+            add_points(interaction.guild.id, self.target_id, int(rcfg.get("register_points", 5)))
+
+        if self.system == "farm" and approved:
+            rcfg = get_config(interaction.guild.id, "ranking")
+            divisor = max(1, int(rcfg.get("farm_points_divisor", 100)))
+            add_points(interaction.guild.id, self.target_id, max(1, int(row["quantidade"]) // divisor))
+
+        e = interaction.message.embeds[0] if interaction.message.embeds else embed("Solicitação")
+        e.color = GREEN if approved else RED
+        e.add_field(
+            name="Resultado",
+            value=f"{'✅ Aprovado' if approved else '❌ Reprovado'} por {interaction.user.mention}",
+            inline=False
+        )
+        await interaction.response.edit_message(embed=e, view=None)
+
+# ============================================================
+# VENDAS
+# ============================================================
+
+class ProductSelect(discord.ui.Select):
+    def __init__(self, products):
+        opts = [
+            discord.SelectOption(
+                label=p["name"][:100],
+                value=str(i),
+                description=money(float(p["price"]))[:100],
+                emoji="📦"
+            )
+            for i, p in enumerate(products[:25])
+        ]
+        super().__init__(
+            placeholder="1️⃣ Escolha o produto vendido",
+            options=opts,
+            min_values=1,
+            max_values=1
+        )
+
+
+class SaleStepView(discord.ui.View):
+    def __init__(self, products):
+        super().__init__(timeout=180)
+        self.products = products
+        sel = ProductSelect(products)
+        sel.callback = self.product_callback
+        self.add_item(sel)
+
+    async def product_callback(self, interaction):
+        idx = int(self.children[0].values[0])
+        product = self.products[idx]
+        await interaction.response.edit_message(
+            content=f"**Produto:** {product['name']}\\n2️⃣ Agora escolha o tipo da venda:",
+            view=PartnershipChoiceView(product["name"], float(product["price"]))
+        )
+
+
+class PartnershipChoiceView(discord.ui.View):
+    def __init__(self, product, price):
+        super().__init__(timeout=180)
+        self.product = product
+        self.price = price
+
+    @discord.ui.button(label="Com Parceria", emoji="🤝", style=discord.ButtonStyle.success)
+    async def partner(self, interaction, button):
+        await interaction.response.send_modal(
+            SaleQuantityModal(self.product, self.price, True)
+        )
+
+    @discord.ui.button(label="Sem Parceria", emoji="💵", style=discord.ButtonStyle.secondary)
+    async def no_partner(self, interaction, button):
+        await interaction.response.send_modal(
+            SaleQuantityModal(self.product, self.price, False)
+        )
+
+
+class SaleQuantityModal(discord.ui.Modal, title="Registrar Nova Venda"):
+    quantidade = discord.ui.TextInput(
+        label="Quantidade",
+        placeholder="Ex: 2",
+        max_length=10
+    )
+
+    def __init__(self, product, price, is_partner):
+        super().__init__()
+        self.product = product
+        self.price = float(price)
+        self.is_partner = bool(is_partner)
+
+    async def on_submit(self, interaction):
+        if not enabled(interaction.guild.id, "vendas"):
+            return await interaction.response.send_message(
+                "❌ Sistema de vendas está desligado.",
+                ephemeral=True
+            )
+        if not has_access(interaction.user, "vendas"):
+            return await interaction.response.send_message(
+                "❌ Você não possui o cargo necessário para registrar vendas.",
+                ephemeral=True
+            )
+
+        try:
+            qty = parse_int(self.quantidade)
+            if qty <= 0:
+                raise ValueError
+        except ValueError:
+            return await interaction.response.send_message(
+                "❌ Quantidade inválida.",
+                ephemeral=True
+            )
+
+        cfg = get_config(interaction.guild.id, "vendas")
+        price = self.price
+        if self.is_partner:
+            price *= (1 - float(cfg.get("partner_discount", 0)) / 100)
+        total = price * qty
+
+        conn = connect()
+        conn.execute(
+            """INSERT INTO vendas(guild_id,user_id,produto,parceria,quantidade,unit_price,total,created_at)
+               VALUES(?,?,?,?,?,?,?,?)""",
+            (
+                interaction.guild.id,
+                interaction.user.id,
+                self.product,
+                int(self.is_partner),
+                qty,
+                price,
+                total,
+                now_iso()
+            )
+        )
+        conn.commit()
+        conn.close()
+
+        rcfg = get_config(interaction.guild.id, "ranking")
+        add_points(
+            interaction.guild.id,
+            interaction.user.id,
+            int(rcfg.get("sale_points", 2))
+        )
+
+        await interaction.response.send_message(
+            embed=embed(
+                "✅ Venda Registrada",
+                f"**Produto:** {self.product}\\n"
+                f"**Quantidade:** {qty}\\n"
+                f"**Parceria:** {'Sim' if self.is_partner else 'Não'}\\n"
+                f"**Total:** {money(total)}",
+                GREEN,
+                guild_id=interaction.guild.id
+            ),
+            ephemeral=True
+        )
+
+        await log_event(
+            interaction.guild,
+            "vendas",
+            "💵 Nova Venda",
+            f"{interaction.user.mention}\\n"
+            f"**{self.product}** x {qty}\\n"
+            f"**Parceria:** {'Sim' if self.is_partner else 'Não'}\\n"
+            f"**Total:** {money(total)}",
+            GREEN
+        )
+
+
+class VendasPanel(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="Registrar Venda",
+        emoji="📦",
+        style=discord.ButtonStyle.secondary,
+        custom_id="public:venda"
+    )
+    async def sale(self, interaction, button):
+        cfg = get_config(interaction.guild.id, "vendas")
+        products = cfg.get("products", [])
+
+        if not enabled(interaction.guild.id, "vendas"):
+            return await deny(interaction, "❌ Sistema desligado.")
+        if not products:
+            return await interaction.response.send_message(
+                "❌ Nenhum produto cadastrado.",
+                ephemeral=True
+            )
+        if not has_access(interaction.user, "vendas"):
+            return await interaction.response.send_message(
+                "❌ Você não possui o cargo necessário para registrar vendas.",
+                ephemeral=True
+            )
+
+        await interaction.response.send_message(
+            "1️⃣ Selecione o produto:",
+            view=SaleStepView(products),
+            ephemeral=True
+        )
+
+# ============================================================
+# BANCO
+# ============================================================
+
+class BankDescriptionModal(discord.ui.Modal):
+    descricao = discord.ui.TextInput(
+        label="Descrição",
+        placeholder="Motivo da movimentação",
+        max_length=200
+    )
+
+    def __init__(self, tipo, valor):
+        super().__init__(title=f"{'Depositar' if tipo == 'entrada' else 'Retirar'} no Banco")
+        self.tipo = tipo
+        self.valor = float(valor)
+
+    async def on_submit(self, interaction):
+        if not has_access(interaction.user, "banco"):
+            return await interaction.response.send_message("❌ Sem permissão.", ephemeral=True)
+
+        conn = connect()
+        conn.execute(
+            "INSERT INTO banco(guild_id,user_id,tipo,valor,descricao,created_at) VALUES(?,?,?,?,?,?)",
+            (
+                interaction.guild.id,
+                interaction.user.id,
+                self.tipo,
+                self.valor,
+                str(self.descricao),
+                now_iso()
+            )
+        )
+        conn.commit()
+        conn.close()
+
+        await interaction.response.send_message(
+            embed=embed(
+                "✅ Movimentação Registrada",
+                f"**Tipo:** {'Depósito' if self.tipo == 'entrada' else 'Retirada'}\\n"
+                f"**Valor:** {money(self.valor)}\\n"
+                f"**Descrição:** {self.descricao}",
+                GREEN,
+                guild_id=interaction.guild.id
+            ),
+            ephemeral=True
+        )
+
+        await log_event(
+            interaction.guild,
+            "banco",
+            "🏦 Movimentação Bancária",
+            f"{interaction.user.mention}\\n"
+            f"**Tipo:** {self.tipo}\\n"
+            f"**Valor:** {money(self.valor)}\\n"
+            f"**Descrição:** {self.descricao}"
+        )
+
+
+class BankCustomAmountModal(discord.ui.Modal, title="Outro Valor"):
+    valor = discord.ui.TextInput(label="Valor", placeholder="Ex: 250000", max_length=20)
+    descricao = discord.ui.TextInput(label="Descrição", placeholder="Motivo da movimentação", max_length=200)
+
+    def __init__(self, tipo):
+        super().__init__()
+        self.tipo = tipo
+
+    async def on_submit(self, interaction):
+        if not has_access(interaction.user, "banco"):
+            return await deny(interaction)
+        try:
+            value = parse_money(self.valor)
+            if value <= 0:
+                raise ValueError
+        except ValueError:
+            return await interaction.response.send_message("❌ Valor inválido.", ephemeral=True)
+
+        conn = connect()
+        conn.execute(
+            "INSERT INTO banco(guild_id,user_id,tipo,valor,descricao,created_at) VALUES(?,?,?,?,?,?)",
+            (interaction.guild.id, interaction.user.id, self.tipo, value, str(self.descricao), now_iso())
+        )
+        conn.commit()
+        conn.close()
+
+        await interaction.response.send_message(
+            embed=embed(
+                "✅ Movimentação Registrada",
+                f"**Tipo:** {'Depósito' if self.tipo == 'entrada' else 'Retirada'}\\n"
+                f"**Valor:** {money(value)}\\n"
+                f"**Descrição:** {self.descricao}",
+                GREEN,
+                guild_id=interaction.guild.id
+            ),
+            ephemeral=True
+        )
+        await log_event(
+            interaction.guild, "banco", "🏦 Movimentação Bancária",
+            f"{interaction.user.mention}\\n**Tipo:** {self.tipo}\\n**Valor:** {money(value)}\\n**Descrição:** {self.descricao}"
+        )
+
+
+class BankAmountView(discord.ui.View):
+    def __init__(self, tipo):
+        super().__init__(timeout=120)
+        self.tipo = tipo
+
+    @discord.ui.button(label="R$ 100 mil", style=discord.ButtonStyle.secondary)
+    async def a100(self, interaction, button):
+        await interaction.response.send_modal(BankDescriptionModal(self.tipo, 100000))
+
+    @discord.ui.button(label="R$ 500 mil", style=discord.ButtonStyle.secondary)
+    async def a500(self, interaction, button):
+        await interaction.response.send_modal(BankDescriptionModal(self.tipo, 500000))
+
+    @discord.ui.button(label="R$ 1 milhão", style=discord.ButtonStyle.secondary)
+    async def a1m(self, interaction, button):
+        await interaction.response.send_modal(BankDescriptionModal(self.tipo, 1000000))
+
+    @discord.ui.button(label="Outro valor", emoji="✏️", style=discord.ButtonStyle.primary)
+    async def other(self, interaction, button):
+        await interaction.response.send_modal(BankCustomAmountModal(self.tipo))
+
+
+def bank_balance(guild_id):
+    conn = connect()
+    rows = conn.execute("SELECT tipo,valor FROM banco WHERE guild_id=?", (guild_id,)).fetchall()
+    conn.close()
+    return sum(float(r["valor"]) if r["tipo"] == "entrada" else -float(r["valor"]) for r in rows)
+
+
+class BancoPanel(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Depositar", emoji="➕", style=discord.ButtonStyle.success, custom_id="public:bank_in")
+    async def deposit(self, interaction, button):
+        if not enabled(interaction.guild.id, "banco"):
+            return await deny(interaction, "❌ Sistema desligado.")
+        if not has_access(interaction.user, "banco"):
+            return await deny(interaction)
+        await interaction.response.send_message("💰 Escolha o valor do depósito:", view=BankAmountView("entrada"), ephemeral=True)
+
+    @discord.ui.button(label="Retirar", emoji="➖", style=discord.ButtonStyle.danger, custom_id="public:bank_out")
+    async def withdraw(self, interaction, button):
+        if not enabled(interaction.guild.id, "banco"):
+            return await deny(interaction, "❌ Sistema desligado.")
+        if not has_access(interaction.user, "banco"):
+            return await deny(interaction)
+        await interaction.response.send_message("💰 Escolha o valor da retirada:", view=BankAmountView("saida"), ephemeral=True)
+
+    @discord.ui.button(label="Ver Saldo", emoji="💰", style=discord.ButtonStyle.secondary, custom_id="public:bank_balance")
+    async def balance(self, interaction, button):
+        if not has_access(interaction.user, "banco"):
+            return await deny(interaction)
+        await interaction.response.send_message(
+            embed=embed("🏦 Saldo Atual", f"**{money(bank_balance(interaction.guild.id))}**", guild_id=interaction.guild.id),
+            ephemeral=True
+        )
+
+# ============================================================
+# LAVAGEM
+# ============================================================
+
+async def process_laundry(interaction, bruto):
+    if not has_access(interaction.user, "lavagem"):
+        return await deny(interaction)
+
+    cfg = get_config(interaction.guild.id, "lavagem")
+    taxa = float(cfg.get("laundry_rate", 25))
+    liquido = bruto * (1 - taxa / 100)
+
+    conn = connect()
+    conn.execute(
+        "INSERT INTO lavagens(guild_id,user_id,bruto,taxa,liquido,created_at) VALUES(?,?,?,?,?,?)",
+        (interaction.guild.id, interaction.user.id, bruto, taxa, liquido, now_iso())
+    )
+    conn.commit()
+    conn.close()
+
+    await interaction.response.send_message(
+        embed=embed(
+            "✅ Lavagem Registrada",
+            f"**Bruto:** {money(bruto)}\\n**Taxa:** {taxa:.2f}%\\n**Líquido:** {money(liquido)}",
+            GREEN,
+            guild_id=interaction.guild.id
+        ),
+        ephemeral=True
+    )
+    await log_event(
+        interaction.guild, "lavagem", "💸 Lavagem",
+        f"{interaction.user.mention}\\nBruto: **{money(bruto)}**\\nLíquido: **{money(liquido)}**"
+    )
+
+
+class LaundryCustomModal(discord.ui.Modal, title="Outro Valor de Lavagem"):
+    bruto = discord.ui.TextInput(label="Valor bruto", placeholder="Ex: 750000", max_length=20)
+
+    async def on_submit(self, interaction):
+        try:
+            bruto = parse_money(self.bruto)
+            if bruto <= 0:
+                raise ValueError
+        except ValueError:
+            return await interaction.response.send_message("❌ Valor inválido.", ephemeral=True)
+
+        await process_laundry(interaction, bruto)
+
+
+class LaundryAmountView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=120)
+
+    @discord.ui.button(label="R$ 100 mil", style=discord.ButtonStyle.secondary)
+    async def a100(self, interaction, button):
+        await process_laundry(interaction, 100000)
+
+    @discord.ui.button(label="R$ 500 mil", style=discord.ButtonStyle.secondary)
+    async def a500(self, interaction, button):
+        await process_laundry(interaction, 500000)
+
+    @discord.ui.button(label="R$ 1 milhão", style=discord.ButtonStyle.secondary)
+    async def a1m(self, interaction, button):
+        await process_laundry(interaction, 1000000)
+
+    @discord.ui.button(label="Outro valor", emoji="✏️", style=discord.ButtonStyle.primary)
+    async def other(self, interaction, button):
+        await interaction.response.send_modal(LaundryCustomModal())
+
+
+class LavagemPanel(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Registrar Lavagem", emoji="💸", style=discord.ButtonStyle.primary, custom_id="public:laundry")
+    async def register(self, interaction, button):
+        if not enabled(interaction.guild.id, "lavagem"):
+            return await deny(interaction, "❌ Sistema desligado.")
+        if not has_access(interaction.user, "lavagem"):
+            return await deny(interaction)
+        await interaction.response.send_message("💸 Escolha o valor bruto:", view=LaundryAmountView(), ephemeral=True)
+
+# ============================================================
+# ENCOMENDAS
+# ============================================================
+
+async def save_order(interaction, responsavel_id, destinatario_id, prazo, descricao):
+    conn = connect()
+    cur = conn.cursor()
+    cur.execute(
+        """INSERT INTO encomendas(guild_id,author_id,responsavel_id,descricao,data_hora,destinatario,status,created_at)
+           VALUES(?,?,?,?,?,?,'pendente',?)""",
+        (
+            interaction.guild.id, interaction.user.id, responsavel_id, descricao,
+            prazo, f"<@{destinatario_id}>", now_iso()
+        )
+    )
+    oid = cur.lastrowid
+    conn.commit()
+    conn.close()
+
+    e = embed("📦 Nova Encomenda", "Aguardando aprovação.", guild_id=interaction.guild.id)
+    e.add_field(name="Responsável", value=f"<@{responsavel_id}>", inline=False)
+    e.add_field(name="Destinatário", value=f"<@{destinatario_id}>", inline=False)
+    e.add_field(name="Prazo", value=prazo, inline=True)
+    e.add_field(name="Pedido", value=descricao, inline=False)
+    e.set_footer(text=f"ENC#{oid} • {get_theme(interaction.guild.id)['footer']}")
+
+    cfg = get_config(interaction.guild.id, "encomendas")
+    ch = interaction.guild.get_channel(int(cfg["log_channel_id"])) if cfg.get("log_channel_id") else None
+    if ch:
+        await ch.send(embed=e, view=ApprovalView("encomendas", oid, responsavel_id))
+
+    await interaction.response.send_message("✅ Encomenda enviada para análise.", ephemeral=True)
+
+
+class OrderDescriptionModal(discord.ui.Modal, title="Descrição da Encomenda"):
+    descricao = discord.ui.TextInput(label="Descrição do Pedido", style=discord.TextStyle.paragraph, max_length=800)
+
+    def __init__(self, responsavel_id, destinatario_id, prazo):
+        super().__init__()
+        self.responsavel_id = int(responsavel_id)
+        self.destinatario_id = int(destinatario_id)
+        self.prazo = str(prazo)
+
+    async def on_submit(self, interaction):
+        if not has_access(interaction.user, "encomendas"):
+            return await deny(interaction)
+        await save_order(
+            interaction,
+            self.responsavel_id,
+            self.destinatario_id,
+            self.prazo,
+            str(self.descricao)
+        )
+
+
+class OrderCustomModal(discord.ui.Modal, title="Encomenda Personalizada"):
+    prazo = discord.ui.TextInput(label="Data / horário", placeholder="Ex: 02/09 às 20:00", max_length=80)
+    descricao = discord.ui.TextInput(label="Descrição do Pedido", style=discord.TextStyle.paragraph, max_length=800)
+
+    def __init__(self, responsavel_id, destinatario_id):
+        super().__init__()
+        self.responsavel_id = int(responsavel_id)
+        self.destinatario_id = int(destinatario_id)
+
+    async def on_submit(self, interaction):
+        if not has_access(interaction.user, "encomendas"):
+            return await deny(interaction)
+        await save_order(
+            interaction,
+            self.responsavel_id,
+            self.destinatario_id,
+            str(self.prazo),
+            str(self.descricao)
+        )
+
+
+class OrderDeadlineView(discord.ui.View):
+    def __init__(self, responsavel_id, destinatario_id):
+        super().__init__(timeout=120)
+        self.responsavel_id = int(responsavel_id)
+        self.destinatario_id = int(destinatario_id)
+
+    @discord.ui.button(label="Hoje", emoji="📅", style=discord.ButtonStyle.secondary)
+    async def today(self, interaction, button):
+        await interaction.response.send_modal(OrderDescriptionModal(self.responsavel_id, self.destinatario_id, "Hoje"))
+
+    @discord.ui.button(label="Amanhã", emoji="➡️", style=discord.ButtonStyle.secondary)
+    async def tomorrow(self, interaction, button):
+        await interaction.response.send_modal(OrderDescriptionModal(self.responsavel_id, self.destinatario_id, "Amanhã"))
+
+    @discord.ui.button(label="Em 3 dias", emoji="3️⃣", style=discord.ButtonStyle.secondary)
+    async def three(self, interaction, button):
+        await interaction.response.send_modal(OrderDescriptionModal(self.responsavel_id, self.destinatario_id, "Em 3 dias"))
+
+    @discord.ui.button(label="Personalizar", emoji="✏️", style=discord.ButtonStyle.primary)
+    async def custom(self, interaction, button):
+        await interaction.response.send_modal(OrderCustomModal(self.responsavel_id, self.destinatario_id))
+
+
+class RecipientUserSelect(discord.ui.UserSelect):
+    def __init__(self, responsavel_id):
+        self.responsavel_id = int(responsavel_id)
+        super().__init__(placeholder="Selecione quem receberá a encomenda", min_values=1, max_values=1)
+
+    async def callback(self, interaction):
+        await interaction.response.edit_message(
+            content="📅 Agora escolha o prazo:",
+            view=OrderDeadlineView(self.responsavel_id, self.values[0].id)
+        )
+
+
+class RecipientUserView(discord.ui.View):
+    def __init__(self, responsavel_id):
+        super().__init__(timeout=120)
+        self.add_item(RecipientUserSelect(responsavel_id))
+
+
+class ResponsibleUserSelect(discord.ui.UserSelect):
+    def __init__(self):
+        super().__init__(placeholder="Selecione o responsável pelo pedido", min_values=1, max_values=1)
+
+    async def callback(self, interaction):
+        await interaction.response.edit_message(
+            content="👤 Agora selecione o destinatário:",
+            view=RecipientUserView(self.values[0].id)
+        )
+
+
+class OrderStartView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=120)
+        self.add_item(ResponsibleUserSelect())
+
+
+class EncomendasPanel(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Abrir Encomenda", emoji="📦", style=discord.ButtonStyle.secondary, custom_id="public:order")
+    async def order(self, interaction, button):
+        if not enabled(interaction.guild.id, "encomendas"):
+            return await deny(interaction, "❌ Sistema desligado.")
+        if not has_access(interaction.user, "encomendas"):
+            return await deny(interaction)
+
+        await interaction.response.send_message(
+            "👤 Selecione o responsável pelo pedido:",
+            view=OrderStartView(),
+            ephemeral=True
+        )
+
+# ============================================================
+# AUSÊNCIA
+# ============================================================
+
+async def save_absence(interaction, periodo, motivo):
+    conn = connect()
+    cur = conn.cursor()
+    cur.execute(
+        """INSERT INTO ausencias(guild_id,user_id,periodo,motivo,status,created_at)
+           VALUES(?,?,?,?,'pendente',?)""",
+        (interaction.guild.id, interaction.user.id, periodo, motivo, now_iso())
+    )
+    aid = cur.lastrowid
+    conn.commit()
+    conn.close()
+
+    e = embed("⌛ Solicitação de Ausência", "Aguardando aprovação.", guild_id=interaction.guild.id)
+    e.add_field(name="Membro", value=interaction.user.mention, inline=False)
+    e.add_field(name="Período", value=periodo, inline=False)
+    e.add_field(name="Motivo", value=motivo, inline=False)
+    e.set_footer(text=f"AUS#{aid} • {get_theme(interaction.guild.id)['footer']}")
+
+    cfg = get_config(interaction.guild.id, "ausencia")
+    ch = interaction.guild.get_channel(int(cfg["log_channel_id"])) if cfg.get("log_channel_id") else None
+    if ch:
+        await ch.send(embed=e, view=ApprovalView("ausencia", aid, interaction.user.id))
+
+    await interaction.response.send_message("✅ Solicitação enviada.", ephemeral=True)
+
+
+class AbsenceReasonModal(discord.ui.Modal, title="Motivo da Ausência"):
+    motivo = discord.ui.TextInput(label="Motivo", style=discord.TextStyle.paragraph, max_length=500)
+
+    def __init__(self, periodo):
+        super().__init__()
+        self.periodo = str(periodo)
+
+    async def on_submit(self, interaction):
+        await save_absence(interaction, self.periodo, str(self.motivo))
+
+
+class AbsenceCustomModal(discord.ui.Modal, title="Ausência Personalizada"):
+    periodo = discord.ui.TextInput(label="Período", placeholder="Ex: 31/08 até 05/09", max_length=80)
+    motivo = discord.ui.TextInput(label="Motivo", style=discord.TextStyle.paragraph, max_length=500)
+
+    async def on_submit(self, interaction):
+        await save_absence(interaction, str(self.periodo), str(self.motivo))
+
+
+class AbsencePeriodView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=120)
+
+    @discord.ui.button(label="1 dia", style=discord.ButtonStyle.secondary)
+    async def one(self, interaction, button):
+        await interaction.response.send_modal(AbsenceReasonModal("1 dia"))
+
+    @discord.ui.button(label="3 dias", style=discord.ButtonStyle.secondary)
+    async def three(self, interaction, button):
+        await interaction.response.send_modal(AbsenceReasonModal("3 dias"))
+
+    @discord.ui.button(label="7 dias", style=discord.ButtonStyle.secondary)
+    async def seven(self, interaction, button):
+        await interaction.response.send_modal(AbsenceReasonModal("7 dias"))
+
+    @discord.ui.button(label="15 dias", style=discord.ButtonStyle.secondary)
+    async def fifteen(self, interaction, button):
+        await interaction.response.send_modal(AbsenceReasonModal("15 dias"))
+
+    @discord.ui.button(label="Personalizar", emoji="✏️", style=discord.ButtonStyle.primary)
+    async def custom(self, interaction, button):
+        await interaction.response.send_modal(AbsenceCustomModal())
+
+
+class AusenciaPanel(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Solicitar Ausência", emoji="⌛", style=discord.ButtonStyle.secondary, custom_id="public:absence")
+    async def absence(self, interaction, button):
+        if not enabled(interaction.guild.id, "ausencia"):
+            return await deny(interaction, "❌ Sistema desligado.")
+
+        await interaction.response.send_message(
+            "⌛ Por quanto tempo você ficará ausente?",
+            view=AbsencePeriodView(),
+            ephemeral=True
+        )
+
+# ============================================================
+# FARM
+# ============================================================
+
+class FarmItemSelect(discord.ui.Select):
+    def __init__(self, items):
+        options = [
+            discord.SelectOption(
+                label=str(item)[:100],
+                value=str(i),
+                emoji="📦"
+            )
+            for i, item in enumerate(items[:25])
+        ]
+        super().__init__(
+            placeholder="Escolha o item farmado",
+            options=options,
+            min_values=1,
+            max_values=1
+        )
+
+
+class FarmItemSelectView(discord.ui.View):
+    def __init__(self, items):
+        super().__init__(timeout=180)
+        self.items = items
+        select = FarmItemSelect(items)
+        select.callback = self.select_item
+        self.add_item(select)
+
+    async def select_item(self, interaction):
+        idx = int(self.children[0].values[0])
+        item = self.items[idx]
+        await interaction.response.send_modal(FarmQuantityModal(item))
+
+
+class FarmQuantityModal(discord.ui.Modal, title="Registrar Farm"):
+    quantidade = discord.ui.TextInput(
+        label="Quantidade",
+        placeholder="Ex: 500",
+        max_length=12
+    )
+    comprovante = discord.ui.TextInput(
+        label="Link do comprovante (opcional)",
+        placeholder="https://...",
+        required=False,
+        max_length=500
+    )
+
+    def __init__(self, item):
+        super().__init__()
+        self.item = str(item)
+
+    async def on_submit(self, interaction):
+        if not enabled(interaction.guild.id, "farm"):
+            return await deny(interaction, "❌ Sistema desligado.")
+
+        try:
+            qty = parse_int(self.quantidade)
+            if qty <= 0:
+                raise ValueError
+        except ValueError:
+            return await interaction.response.send_message(
+                "❌ Quantidade inválida.",
+                ephemeral=True
+            )
+
+        proof = str(self.comprovante).strip()
+        if proof and not (proof.startswith("http://") or proof.startswith("https://")):
+            return await interaction.response.send_message(
+                "❌ O comprovante precisa ser um link válido.",
+                ephemeral=True
+            )
+
+        conn = connect()
+        cur = conn.cursor()
+        cur.execute(
+            """INSERT INTO farms(guild_id,user_id,item,quantidade,comprovante,status,created_at)
+               VALUES(?,?,?,?,?,'pendente',?)""",
+            (
+                interaction.guild.id,
+                interaction.user.id,
+                self.item,
+                qty,
+                proof,
+                now_iso()
+            )
+        )
+        fid = cur.lastrowid
+        conn.commit()
+        conn.close()
+
+        e = embed(
+            "📦 Novo Farm",
+            "Aguardando aprovação.",
+            guild_id=interaction.guild.id
+        )
+        e.add_field(name="Membro", value=interaction.user.mention, inline=False)
+        e.add_field(name="Item", value=self.item, inline=True)
+        e.add_field(name="Quantidade", value=str(qty), inline=True)
+
+        if proof:
+            e.add_field(name="Comprovante", value=f"[Abrir comprovante]({proof})", inline=False)
+
+        e.set_footer(text=f"FARM#{fid} • {get_theme(interaction.guild.id)['footer']}")
+
+        cfg = get_config(interaction.guild.id, "farm")
+        ch = interaction.guild.get_channel(
+            int(cfg["log_channel_id"])
+        ) if cfg.get("log_channel_id") else None
+
+        if ch:
+            await ch.send(
+                embed=e,
+                view=ApprovalView("farm", fid, interaction.user.id)
+            )
+
+        await interaction.response.send_message(
+            "✅ Farm enviado para aprovação.",
+            ephemeral=True
+        )
+
+
+class FarmPanel(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="Registrar Farm",
+        emoji="📦",
+        style=discord.ButtonStyle.success,
+        custom_id="public:farm"
+    )
+    async def farm(self, interaction, button):
+        if not enabled(interaction.guild.id, "farm"):
+            return await deny(interaction, "❌ Sistema desligado.")
+
+        cfg = get_config(interaction.guild.id, "farm")
+        items = cfg.get("farm_items", [])
+
+        if not items:
+            return await interaction.response.send_message(
+                "❌ Ainda não existem itens configurados para o Farm.\\n"
+                "Um administrador precisa usar **/gerenciar → Farm → Configurações Específicas → Adicionar Item**.",
+                ephemeral=True
+            )
+
+        await interaction.response.send_message(
+            "📦 **Qual item você farmou?**",
+            view=FarmItemSelectView(items),
+            ephemeral=True
+        )
+
+    @discord.ui.button(
+        label="Ranking",
+        emoji="🏆",
+        style=discord.ButtonStyle.secondary,
+        custom_id="public:farm_rank"
+    )
+    async def rank(self, interaction, button):
+        conn = connect()
+        rows = conn.execute(
+            """SELECT user_id,SUM(quantidade) total FROM farms
+               WHERE guild_id=? AND status='aprovado'
+               GROUP BY user_id ORDER BY total DESC LIMIT 10""",
+            (interaction.guild.id,)
+        ).fetchall()
+        conn.close()
+
+        lines = [
+            f"**{i+1}.** <@{r['user_id']}> — **{r['total']}**"
+            for i, r in enumerate(rows)
+        ]
+
+        # Ranking é uma resposta compacta: sem banner gigante.
+        await interaction.response.send_message(
+            embed=embed(
+                "🏆 Ranking de Farm",
+                "\\n".join(lines) or "Sem farms aprovados.",
+                guild_id=interaction.guild.id,
+                use_theme_image=False,
+                use_theme_thumbnail=True
+            ),
+            ephemeral=True
+        )
+
+# ============================================================
+# BAÚ
+# ============================================================
+
+class StockQuantityModal(discord.ui.Modal):
+    quantidade = discord.ui.TextInput(label="Quantidade", placeholder="Ex: 100", max_length=12)
+
+    def __init__(self, bau, tipo, item):
+        super().__init__(title=f"{tipo.title()} • {item}")
+        self.bau = bau
+        self.tipo = tipo
+        self.item = str(item)
+
+    async def on_submit(self, interaction):
+        if not has_access(interaction.user, "bau"):
+            return await deny(interaction)
+
+        if self.bau == "lider" and not is_admin(interaction.user):
+            cfg = get_config(interaction.guild.id, "bau")
+            leader_ids = {int(x) for x in cfg.get("leader_role_ids", [])}
+            if leader_ids and not any(r.id in leader_ids for r in interaction.user.roles):
+                return await deny(interaction, "❌ Você não possui um cargo autorizado para o Baú de Líder.")
+
+        try:
+            qty = parse_int(self.quantidade)
+            if qty <= 0:
+                raise ValueError
+        except ValueError:
+            return await interaction.response.send_message("❌ Quantidade inválida.", ephemeral=True)
+
+        conn = connect()
+        row = conn.execute(
+            "SELECT quantidade FROM estoque WHERE guild_id=? AND bau=? AND item=?",
+            (interaction.guild.id, self.bau, self.item)
+        ).fetchone()
+        current = int(row["quantidade"]) if row else 0
+        delta = qty if self.tipo == "entrada" else -qty
+
+        if current + delta < 0:
+            conn.close()
+            return await interaction.response.send_message(
+                f"❌ Estoque insuficiente. Atual: **{current}**.",
+                ephemeral=True
+            )
+
+        conn.execute(
+            """INSERT INTO estoque(guild_id,bau,item,quantidade) VALUES(?,?,?,?)
+               ON CONFLICT(guild_id,bau,item) DO UPDATE SET quantidade=quantidade+excluded.quantidade""",
+            (interaction.guild.id, self.bau, self.item, delta)
+        )
+        conn.execute(
+            "INSERT INTO estoque_mov(guild_id,user_id,bau,tipo,item,quantidade,created_at) VALUES(?,?,?,?,?,?,?)",
+            (interaction.guild.id, interaction.user.id, self.bau, self.tipo, self.item, qty, now_iso())
+        )
+        conn.commit()
+        conn.close()
+
+        await interaction.response.send_message(
+            embed=embed(
+                "✅ Estoque Atualizado",
+                f"**Baú:** {self.bau.title()}\\n**Movimento:** {self.tipo.title()}\\n"
+                f"**Item:** {self.item}\\n**Quantidade:** {qty}",
+                GREEN,
+                guild_id=interaction.guild.id
+            ),
+            ephemeral=True
+        )
+
+        await log_event(
+            interaction.guild, "bau", "🧰 Movimento de Baú",
+            f"{interaction.user.mention}\\n**Baú:** {self.bau}\\n**Tipo:** {self.tipo}\\n"
+            f"**Item:** {self.item}\\n**Qtd:** {qty}"
+        )
+
+
+class StockItemSelect(discord.ui.Select):
+    def __init__(self, items, bau, tipo):
+        self.items_data = items
+        self.bau = bau
+        self.tipo = tipo
+        super().__init__(
+            placeholder="Escolha o item",
+            min_values=1,
+            max_values=1,
+            options=[
+                discord.SelectOption(label=str(item)[:100], value=str(i), emoji="📦")
+                for i, item in enumerate(items[:25])
+            ]
+        )
+
+    async def callback(self, interaction):
+        item = self.items_data[int(self.values[0])]
+        await interaction.response.send_modal(StockQuantityModal(self.bau, self.tipo, item))
+
+
+class StockItemView(discord.ui.View):
+    def __init__(self, items, bau, tipo):
+        super().__init__(timeout=120)
+        self.add_item(StockItemSelect(items, bau, tipo))
+
+
+async def start_stock_flow(interaction, bau, tipo):
+    if not enabled(interaction.guild.id, "bau"):
+        return await deny(interaction, "❌ Sistema desligado.")
+    if not has_access(interaction.user, "bau"):
+        return await deny(interaction)
+
+    if bau == "lider" and not is_admin(interaction.user):
+        cfg = get_config(interaction.guild.id, "bau")
+        leader_ids = {int(x) for x in cfg.get("leader_role_ids", [])}
+        if leader_ids and not any(r.id in leader_ids for r in interaction.user.roles):
+            return await deny(interaction, "❌ Você não possui um cargo autorizado para o Baú de Líder.")
+
+    cfg = get_config(interaction.guild.id, "bau")
+    items = cfg.get("stock_items", [])
+    if not items:
+        return await interaction.response.send_message(
+            "❌ Nenhum item foi configurado no Baú.\\n"
+            "Use **/gerenciar → Baús / Estoque → Configurações Específicas → Adicionar Item**.",
+            ephemeral=True
+        )
+
+    await interaction.response.send_message(
+        f"📦 Escolha o item para **{tipo}** no Baú **{bau.title()}**:",
+        view=StockItemView(items, bau, tipo),
+        ephemeral=True
+    )
+
+
+class BauPanel(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Entrada Geral", emoji="➕", style=discord.ButtonStyle.success, custom_id="public:stock_g_in")
+    async def gin(self, interaction, button):
+        await start_stock_flow(interaction, "geral", "entrada")
+
+    @discord.ui.button(label="Retirada Geral", emoji="➖", style=discord.ButtonStyle.danger, custom_id="public:stock_g_out")
+    async def gout(self, interaction, button):
+        await start_stock_flow(interaction, "geral", "retirada")
+
+    @discord.ui.button(label="Entrada Líder", emoji="👑", style=discord.ButtonStyle.success, custom_id="public:stock_l_in")
+    async def lin(self, interaction, button):
+        await start_stock_flow(interaction, "lider", "entrada")
+
+    @discord.ui.button(label="Retirada Líder", emoji="👑", style=discord.ButtonStyle.danger, custom_id="public:stock_l_out")
+    async def lout(self, interaction, button):
+        await start_stock_flow(interaction, "lider", "retirada")
+
+    @discord.ui.button(label="Ver Estoque", emoji="📦", style=discord.ButtonStyle.secondary, custom_id="public:stock_show")
+    async def show(self, interaction, button):
+        if not has_access(interaction.user, "bau"):
+            return await deny(interaction)
+
+        conn = connect()
+        rows = conn.execute(
+            "SELECT bau,item,quantidade FROM estoque WHERE guild_id=? ORDER BY bau,item",
+            (interaction.guild.id,)
+        ).fetchall()
+        conn.close()
+
+        lines = [f"`{r['bau'].upper():5}` **{r['item']}** — {r['quantidade']}" for r in rows[:40]]
+        await interaction.response.send_message(
+            embed=embed("🧰 Estoque Atual", "\\n".join(lines) or "Estoque vazio.", guild_id=interaction.guild.id),
+            ephemeral=True
+        )
+
+# ============================================================
+# AÇÕES — CRIAÇÃO, PARTICIPAÇÃO, RESULTADO E FINANCEIRO
+# ============================================================
+
+def get_action(action_id: int):
+    conn = connect()
+    row = conn.execute(
+        "SELECT * FROM acoes WHERE id=?",
+        (int(action_id),)
+    ).fetchone()
+    conn.close()
+    return row
+
+
+def get_action_participants(action_id: int):
+    conn = connect()
+    rows = conn.execute(
+        """SELECT user_id,joined_at
+           FROM acoes_participantes
+           WHERE action_id=?
+           ORDER BY joined_at ASC""",
+        (int(action_id),)
+    ).fetchall()
+    conn.close()
+    return rows
+
+
+def get_actions(guild_id: int, only_open=True, limit=25):
+    conn = connect()
+    if only_open:
+        rows = conn.execute(
+            """SELECT * FROM acoes
+               WHERE guild_id=? AND status='aberta'
+               ORDER BY id DESC LIMIT ?""",
+            (guild_id, limit)
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            """SELECT * FROM acoes
+               WHERE guild_id=?
+               ORDER BY id DESC LIMIT ?""",
+            (guild_id, limit)
+        ).fetchall()
+    conn.close()
+    return rows
+
+
+def action_status_label(row):
+    if row["status"] == "aberta":
+        return "🟢 Aberta"
+    if row["resultado"] == "vitoria":
+        return "🏆 Vitória"
+    if row["resultado"] == "derrota":
+        return "❌ Derrota"
+    return "⚫ Encerrada"
+
+
+def build_action_embed(guild: discord.Guild, action_id: int):
+    row = get_action(action_id)
+    if not row:
+        return embed(
+            "❌ Ação não encontrada",
+            "Essa ação não existe mais.",
+            RED,
+            guild_id=guild.id
+        )
+
+    participants = get_action_participants(action_id)
+    mentions = [f"<@{r['user_id']}>" for r in participants]
+
+    if mentions:
+        # Evita estourar limite da embed
+        participant_text = "\n".join(
+            f"• {m}" for m in mentions[:40]
+        )
+        if len(mentions) > 40:
+            participant_text += f"\n• +{len(mentions) - 40} participante(s)"
+    else:
+        participant_text = "Nenhum participante ainda."
+
+    desc = (
+        f"**Criador:** <@{row['creator_id']}>\n"
+        f"**Status:** {action_status_label(row)}\n"
+        f"**Horário:** {row['horario'] or 'Não informado'}\n\n"
+        f"**Descrição**\n{row['descricao'] or 'Sem descrição.'}"
+    )
+
+    if row["status"] != "aberta":
+        desc += (
+            f"\n\n**Resultado:** "
+            f"{'🏆 Vitória' if row['resultado'] == 'vitoria' else '❌ Derrota'}"
+        )
+        if float(row["valor_ganho"] or 0) > 0:
+            desc += f"\n**Valor ganho:** {money(float(row['valor_ganho']))}"
+
+    e = embed(
+        f"🎯 {row['nome']}",
+        desc,
+        guild_id=guild.id,
+        use_theme_image=False,
+        use_theme_thumbnail=True
+    )
+    e.add_field(
+        name=f"👥 Participantes ({len(mentions)})",
+        value=participant_text,
+        inline=False
+    )
+    e.set_footer(
+        text=f"AÇÃO #{row['id']} • {get_theme(guild.id)['footer']}"
+    )
+    return e
+
+
+def build_actions_list_embed(guild: discord.Guild, only_open=True):
+    rows = get_actions(guild.id, only_open=only_open, limit=20)
+
+    if not rows:
+        return embed(
+            "🎯 Ações Abertas" if only_open else "📜 Histórico de Ações",
+            "Nenhuma ação encontrada.",
+            guild_id=guild.id
+        )
+
+    lines = []
+    for row in rows:
+        count = len(get_action_participants(row["id"]))
+        result = action_status_label(row)
+        lines.append(
+            f"**#{row['id']} • {row['nome']}**\n"
+            f"{result} • 👥 {count} participante(s) • Criada por <@{row['creator_id']}>"
+        )
+
+    return embed(
+        "🎯 Ações Abertas" if only_open else "📜 Histórico de Ações",
+        "\n\n".join(lines),
+        guild_id=guild.id
+    )
+
+
+class CreateActionModal(discord.ui.Modal, title="Criar Nova Ação"):
+    nome = discord.ui.TextInput(
+        label="Nome da ação",
+        placeholder="Ex: Ação Banco Central",
+        max_length=100
+    )
+    horario = discord.ui.TextInput(
+        label="Horário",
+        placeholder="Ex: Hoje 22:00",
+        required=False,
+        max_length=80
+    )
+    descricao = discord.ui.TextInput(
+        label="Descrição",
+        placeholder="Informações importantes da ação",
+        style=discord.TextStyle.paragraph,
+        required=False,
+        max_length=1000
+    )
+
+    async def on_submit(self, interaction):
+        if not enabled(interaction.guild.id, "acoes"):
+            return await deny(interaction, "❌ Sistema de ações está desligado.")
+        if not has_access(interaction.user, "acoes"):
+            return await deny(interaction)
+
+        conn = connect()
+        cur = conn.cursor()
+        cur.execute(
+            """INSERT INTO acoes(
+                guild_id,creator_id,nome,descricao,horario,status,created_at
+            ) VALUES(?,?,?,?,?,'aberta',?)""",
+            (
+                interaction.guild.id,
+                interaction.user.id,
+                str(self.nome).strip(),
+                str(self.descricao).strip(),
+                str(self.horario).strip(),
+                now_iso()
+            )
+        )
+        action_id = cur.lastrowid
+
+        # Criador entra automaticamente na lista de participantes
+        cur.execute(
+            """INSERT OR IGNORE INTO acoes_participantes(
+                action_id,guild_id,user_id,joined_at
+            ) VALUES(?,?,?,?)""",
+            (
+                action_id,
+                interaction.guild.id,
+                interaction.user.id,
+                now_iso()
+            )
+        )
+        conn.commit()
+        conn.close()
+
+        cfg = get_config(interaction.guild.id, "acoes")
+        ping_role = (
+            interaction.guild.get_role(int(cfg["action_ping_role_id"]))
+            if cfg.get("action_ping_role_id")
+            else None
+        )
+        ping = ping_role.mention if ping_role else ""
+
+        # Log da ação criada
+        await log_event(
+            interaction.guild,
+            "acoes",
+            f"🎯 Nova Ação: {self.nome}",
+            (
+                f"{ping}\n"
+                f"**Criador:** {interaction.user.mention}\n"
+                f"**Horário:** {self.horario or 'Não informado'}\n"
+                f"**Descrição:** {self.descricao or 'Sem descrição'}"
+            )
+        )
+
+        await interaction.response.send_message(
+            content="✅ Ação criada. Esse é o painel dela:",
+            embed=build_action_embed(interaction.guild, action_id),
+            view=ActionDetailView(action_id),
+            ephemeral=True
+        )
+
+
+class ActionSelect(discord.ui.Select):
+    def __init__(self, guild_id: int, only_open=True):
+        rows = get_actions(guild_id, only_open=only_open, limit=25)
+        self.only_open = only_open
+
+        options = []
+        for row in rows:
+            label = f"#{row['id']} • {row['nome']}"[:100]
+            desc = (
+                f"{action_status_label(row)} • "
+                f"{len(get_action_participants(row['id']))} participante(s)"
+            )[:100]
+            options.append(
+                discord.SelectOption(
+                    label=label,
+                    value=str(row["id"]),
+                    description=desc,
+                    emoji="🎯"
+                )
+            )
+
+        if not options:
+            options.append(
+                discord.SelectOption(
+                    label="Nenhuma ação disponível",
+                    value="none",
+                    description="Crie uma nova ação primeiro.",
+                    emoji="📭"
+                )
+            )
+
+        super().__init__(
+            placeholder="Selecione uma ação",
+            min_values=1,
+            max_values=1,
+            options=options
+        )
+
+    async def callback(self, interaction):
+        if self.values[0] == "none":
+            return await interaction.response.send_message(
+                "❌ Nenhuma ação disponível.",
+                ephemeral=True
+            )
+
+        action_id = int(self.values[0])
+        await interaction.response.edit_message(
+            content=None,
+            embed=build_action_embed(interaction.guild, action_id),
+            view=ActionDetailView(action_id)
+        )
+
+
+class ActionBrowserView(discord.ui.View):
+    def __init__(self, guild_id: int, only_open=True):
+        super().__init__(timeout=180)
+        self.add_item(ActionSelect(guild_id, only_open=only_open))
+
+
+class ActionResultView(discord.ui.View):
+    def __init__(self, action_id: int, creator_id: int):
+        super().__init__(timeout=120)
+        self.action_id = int(action_id)
+        self.creator_id = int(creator_id)
+
+    async def interaction_check(self, interaction):
+        if interaction.user.id != self.creator_id and not is_admin(interaction.user):
+            await deny(
+                interaction,
+                "❌ Só quem criou a ação pode informar o resultado."
+            )
+            return False
+        return True
+
+    @discord.ui.button(
+        label="Vitória",
+        emoji="🏆",
+        style=discord.ButtonStyle.success
+    )
+    async def victory(self, interaction, button):
+        await interaction.response.send_modal(
+            ActionVictoryAmountModal(self.action_id, self.creator_id)
+        )
+
+    @discord.ui.button(
+        label="Derrota",
+        emoji="❌",
+        style=discord.ButtonStyle.danger
+    )
+    async def defeat(self, interaction, button):
+        await finish_action(
+            interaction,
+            self.action_id,
+            "derrota",
+            0
+        )
+
+
+class ActionVictoryAmountModal(discord.ui.Modal, title="Valor Ganho na Ação"):
+    valor = discord.ui.TextInput(
+        label="Valor ganho",
+        placeholder="Ex: 1500000",
+        max_length=20
+    )
+
+    def __init__(self, action_id: int, creator_id: int):
+        super().__init__()
+        self.action_id = int(action_id)
+        self.creator_id = int(creator_id)
+
+    async def on_submit(self, interaction):
+        if interaction.user.id != self.creator_id and not is_admin(interaction.user):
+            return await deny(
+                interaction,
+                "❌ Só quem criou a ação pode informar o resultado."
+            )
+
+        try:
+            value = parse_money(self.valor)
+            if value < 0:
+                raise ValueError
+        except ValueError:
+            return await interaction.response.send_message(
+                "❌ Valor inválido.",
+                ephemeral=True
+            )
+
+        await finish_action(
+            interaction,
+            self.action_id,
+            "vitoria",
+            value
+        )
+
+
+async def finish_action(interaction, action_id: int, result: str, value: float):
+    row = get_action(action_id)
+    if not row:
+        return await interaction.response.send_message(
+            "❌ Ação não encontrada.",
+            ephemeral=True
+        )
+
+    if row["status"] != "aberta":
+        return await interaction.response.send_message(
+            "❌ Essa ação já foi encerrada.",
+            ephemeral=True
+        )
+
+    if interaction.user.id != int(row["creator_id"]) and not is_admin(interaction.user):
+        return await deny(
+            interaction,
+            "❌ Só quem criou a ação pode encerrar."
+        )
+
+    conn = connect()
+
+    conn.execute(
+        """UPDATE acoes
+           SET status='encerrada',
+               resultado=?,
+               valor_ganho=?,
+               closed_at=?
+           WHERE id=?""",
+        (
+            result,
+            float(value),
+            now_iso(),
+            action_id
+        )
+    )
+
+    # Vitória: valor entra automaticamente no banco/financeiro da facção
+    if result == "vitoria" and float(value) > 0:
+        conn.execute(
+            """INSERT INTO banco(
+                guild_id,user_id,tipo,valor,descricao,created_at
+            ) VALUES(?,?,?,?,?,?)""",
+            (
+                interaction.guild.id,
+                interaction.user.id,
+                "entrada",
+                float(value),
+                f"Resultado da ação #{action_id} - {row['nome']}",
+                now_iso()
+            )
+        )
+
+    conn.commit()
+    conn.close()
+
+    participants = get_action_participants(action_id)
+
+    await log_event(
+        interaction.guild,
+        "acoes",
+        f"{'🏆 Vitória' if result == 'vitoria' else '❌ Derrota'} • {row['nome']}",
+        (
+            f"**Criador:** <@{row['creator_id']}>\n"
+            f"**Participantes:** {len(participants)}\n"
+            f"**Valor ganho:** {money(value) if value > 0 else 'R$ 0,00'}\n"
+            + (
+                "**Financeiro:** valor adicionado automaticamente ao Banco da facção."
+                if result == "vitoria" and value > 0
+                else "**Financeiro:** nenhuma entrada registrada."
+            )
+        ),
+        GREEN if result == "vitoria" else RED
+    )
+
+    await interaction.response.edit_message(
+        content=(
+            "✅ Ação encerrada. "
+            + (
+                f"**{money(value)}** foi adicionado ao financeiro da facção."
+                if result == "vitoria" and value > 0
+                else "Nenhum valor foi adicionado ao financeiro."
+            )
+        ),
+        embed=build_action_embed(interaction.guild, action_id),
+        view=ActionDetailView(action_id)
+    )
+
+
+class ActionDetailView(discord.ui.View):
+    def __init__(self, action_id: int):
+        super().__init__(timeout=180)
+        self.action_id = int(action_id)
+
+    @discord.ui.button(
+        label="Participar",
+        emoji="✅",
+        style=discord.ButtonStyle.success
+    )
+    async def join(self, interaction, button):
+        row = get_action(self.action_id)
+        if not row:
+            return await interaction.response.send_message(
+                "❌ Ação não encontrada.",
+                ephemeral=True
+            )
+        if row["status"] != "aberta":
+            return await interaction.response.send_message(
+                "❌ Essa ação já foi encerrada.",
+                ephemeral=True
+            )
+        if not has_access(interaction.user, "acoes"):
+            return await deny(interaction)
+
+        conn = connect()
+        existing = conn.execute(
+            """SELECT 1 FROM acoes_participantes
+               WHERE action_id=? AND user_id=?""",
+            (self.action_id, interaction.user.id)
+        ).fetchone()
+
+        if existing:
+            conn.close()
+            return await interaction.response.send_message(
+                "ℹ️ Você já está participando dessa ação.",
+                ephemeral=True
+            )
+
+        conn.execute(
+            """INSERT INTO acoes_participantes(
+                action_id,guild_id,user_id,joined_at
+            ) VALUES(?,?,?,?)""",
+            (
+                self.action_id,
+                interaction.guild.id,
+                interaction.user.id,
+                now_iso()
+            )
+        )
+        conn.commit()
+        conn.close()
+
+        await interaction.response.edit_message(
+            embed=build_action_embed(interaction.guild, self.action_id),
+            view=ActionDetailView(self.action_id)
+        )
+
+    @discord.ui.button(
+        label="Sair",
+        emoji="🚪",
+        style=discord.ButtonStyle.secondary
+    )
+    async def leave(self, interaction, button):
+        row = get_action(self.action_id)
+        if not row:
+            return await interaction.response.send_message(
+                "❌ Ação não encontrada.",
+                ephemeral=True
+            )
+        if row["status"] != "aberta":
+            return await interaction.response.send_message(
+                "❌ Essa ação já foi encerrada.",
+                ephemeral=True
+            )
+
+        # Criador permanece automaticamente na ação
+        if interaction.user.id == int(row["creator_id"]):
+            return await interaction.response.send_message(
+                "❌ O criador da ação não pode sair da lista.",
+                ephemeral=True
+            )
+
+        conn = connect()
+        conn.execute(
+            "DELETE FROM acoes_participantes WHERE action_id=? AND user_id=?",
+            (self.action_id, interaction.user.id)
+        )
+        conn.commit()
+        conn.close()
+
+        await interaction.response.edit_message(
+            embed=build_action_embed(interaction.guild, self.action_id),
+            view=ActionDetailView(self.action_id)
+        )
+
+    @discord.ui.button(
+        label="Atualizar Lista",
+        emoji="🔄",
+        style=discord.ButtonStyle.secondary
+    )
+    async def refresh(self, interaction, button):
+        await interaction.response.edit_message(
+            embed=build_action_embed(interaction.guild, self.action_id),
+            view=ActionDetailView(self.action_id)
+        )
+
+    @discord.ui.button(
+        label="Finalizar Ação",
+        emoji="🏁",
+        style=discord.ButtonStyle.danger
+    )
+    async def finish(self, interaction, button):
+        row = get_action(self.action_id)
+        if not row:
+            return await interaction.response.send_message(
+                "❌ Ação não encontrada.",
+                ephemeral=True
+            )
+        if row["status"] != "aberta":
+            return await interaction.response.send_message(
+                "❌ Essa ação já foi encerrada.",
+                ephemeral=True
+            )
+
+        if interaction.user.id != int(row["creator_id"]) and not is_admin(interaction.user):
+            return await deny(
+                interaction,
+                "❌ Só quem criou a ação pode finalizar."
+            )
+
+        await interaction.response.send_message(
+            "🏁 Qual foi o resultado da ação?",
+            view=ActionResultView(self.action_id, int(row["creator_id"])),
+            ephemeral=True
+        )
+
+
+class AcoesPanel(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="Criar Ação",
+        emoji="➕",
+        style=discord.ButtonStyle.success,
+        custom_id="public:action:create"
+    )
+    async def create_action(self, interaction, button):
+        if not enabled(interaction.guild.id, "acoes"):
+            return await deny(interaction, "❌ Sistema desligado.")
+        if not has_access(interaction.user, "acoes"):
+            return await deny(interaction)
+
+        await interaction.response.send_modal(CreateActionModal())
+
+    @discord.ui.button(
+        label="Ações Abertas",
+        emoji="🎯",
+        style=discord.ButtonStyle.primary,
+        custom_id="public:action:open"
+    )
+    async def open_actions(self, interaction, button):
+        if not enabled(interaction.guild.id, "acoes"):
+            return await deny(interaction, "❌ Sistema desligado.")
+
+        rows = get_actions(interaction.guild.id, only_open=True, limit=25)
+        if not rows:
+            return await interaction.response.send_message(
+                "📭 Não existe nenhuma ação aberta no momento.",
+                ephemeral=True
+            )
+
+        await interaction.response.send_message(
+            embed=build_actions_list_embed(interaction.guild, only_open=True),
+            view=ActionBrowserView(interaction.guild.id, only_open=True),
+            ephemeral=True
+        )
+
+    @discord.ui.button(
+        label="Histórico",
+        emoji="📜",
+        style=discord.ButtonStyle.secondary,
+        custom_id="public:action:history"
+    )
+    async def history(self, interaction, button):
+        rows = get_actions(interaction.guild.id, only_open=False, limit=25)
+        if not rows:
+            return await interaction.response.send_message(
+                "📭 Ainda não existe histórico de ações.",
+                ephemeral=True
+            )
+
+        await interaction.response.send_message(
+            embed=build_actions_list_embed(interaction.guild, only_open=False),
+            view=ActionBrowserView(interaction.guild.id, only_open=False),
+            ephemeral=True
+        )
+
+# ============================================================
+# MODERAÇÃO / HIERARQUIA / RANKING
+# ============================================================
+
+@app_commands.command(name="advertir", description="Aplica advertência em um membro")
+async def advertir(interaction: discord.Interaction, membro: discord.Member, motivo: str, pontos: app_commands.Range[int,1,5] = 1):
+    if not is_admin(interaction.user):
+        return await deny(interaction)
+    conn = connect()
+    conn.execute(
+        "INSERT INTO advertencias(guild_id,user_id,moderator_id,motivo,pontos,created_at) VALUES(?,?,?,?,?,?)",
+        (interaction.guild.id, membro.id, interaction.user.id, motivo, pontos, now_iso())
+    )
+    conn.commit()
+    conn.close()
+    await interaction.response.send_message(
+        embed=embed(
+            "⚠️ Advertência",
+            f"{membro.mention}\n**Motivo:** {motivo}\n**Pontos:** {pontos}\n**Responsável:** {interaction.user.mention}",
+            RED
+        )
+    )
+
+@app_commands.command(name="promover", description="Adiciona um cargo a um membro")
+async def promover(interaction: discord.Interaction, membro: discord.Member, cargo: discord.Role):
+    if not is_admin(interaction.user):
+        return await deny(interaction)
+    if cargo >= interaction.guild.me.top_role:
+        return await deny(interaction, "❌ Esse cargo está acima do cargo do bot.")
+    await membro.add_roles(cargo, reason=f"Promoção por {interaction.user}")
+    add_points(interaction.guild.id, membro.id, 5)
+    await interaction.response.send_message(f"✅ {membro.mention} recebeu {cargo.mention}.")
+
+@app_commands.command(name="rebaixar", description="Remove um cargo de um membro")
+async def rebaixar(interaction: discord.Interaction, membro: discord.Member, cargo: discord.Role):
+    if not is_admin(interaction.user):
+        return await deny(interaction)
+    await membro.remove_roles(cargo, reason=f"Rebaixamento por {interaction.user}")
+    await interaction.response.send_message(f"✅ {cargo.mention} removido de {membro.mention}.")
+
+@app_commands.command(name="ranking", description="Mostra o ranking geral")
+async def ranking(interaction: discord.Interaction):
+    conn = connect()
+    rows = conn.execute(
+        "SELECT user_id,pontos FROM pontos WHERE guild_id=? ORDER BY pontos DESC LIMIT 15",
+        (interaction.guild.id,)
+    ).fetchall()
+    conn.close()
+    lines = [f"**{i+1}.** <@{r['user_id']}> — **{r['pontos']} pts**" for i, r in enumerate(rows)]
+    await interaction.response.send_message(embed=embed("🏆 Ranking Geral", "\n".join(lines) or "Sem pontuação."))
+
+# ============================================================
+# PDF DE FARM (SEM DEPENDÊNCIA EXTERNA)
+# ============================================================
+
+def pdf_escape(s):
+    return str(s).replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+
+def simple_pdf(title, lines):
+    page_chunks = [lines[i:i+40] for i in range(0, len(lines), 40)] or [["Sem dados."]]
+    objs = []
+    objs.append("<< /Type /Catalog /Pages 2 0 R >>")
+    page_nums = []
+    content_nums = []
+    n = 4
+    for _ in page_chunks:
+        page_nums.append(n)
+        content_nums.append(n+1)
+        n += 2
+    objs.append(f"<< /Type /Pages /Kids [{' '.join(f'{x} 0 R' for x in page_nums)}] /Count {len(page_nums)} >>")
+    objs.append("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
+    for i, chunk in enumerate(page_chunks):
+        commands = ["BT", "/F1 15 Tf", "40 800 Td", f"({pdf_escape(title)}) Tj", "0 -26 Td", "/F1 9 Tf"]
+        for line in chunk:
+            clean = str(line).encode("latin-1", "replace").decode("latin-1")[:120]
+            commands += [f"({pdf_escape(clean)}) Tj", "0 -16 Td"]
+        commands.append("ET")
+        stream = "\n".join(commands)
+        objs.append(f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 3 0 R >> >> /Contents {content_nums[i]} 0 R >>")
+        objs.append(f"<< /Length {len(stream.encode('latin-1'))} >>\nstream\n{stream}\nendstream")
+    out = io.BytesIO()
+    out.write(b"%PDF-1.4\n")
+    offsets = [0]
+    for idx, obj in enumerate(objs, 1):
+        offsets.append(out.tell())
+        out.write(f"{idx} 0 obj\n{obj}\nendobj\n".encode("latin-1", "replace"))
+    xref = out.tell()
+    out.write(f"xref\n0 {len(objs)+1}\n0000000000 65535 f \n".encode())
+    for off in offsets[1:]:
+        out.write(f"{off:010d} 00000 n \n".encode())
+    out.write(f"trailer\n<< /Size {len(objs)+1} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF".encode())
+    out.seek(0)
+    return out
+
+@app_commands.command(name="relatorio-farm", description="Gera relatório PDF do farm")
+async def relatorio_farm(interaction: discord.Interaction):
+    if not is_admin(interaction.user) and not can_approve(interaction.user, "farm"):
+        return await deny(interaction)
+    await interaction.response.defer(ephemeral=True)
+    conn = connect()
+    rows = conn.execute(
+        "SELECT user_id,item,quantidade,status,created_at FROM farms WHERE guild_id=? ORDER BY id DESC LIMIT 500",
+        (interaction.guild.id,)
+    ).fetchall()
+    conn.close()
+    lines = [
+        f"{r['created_at'][:10]} | {r['user_id']} | {r['item']} | {r['quantidade']} | {r['status']}"
+        for r in rows
+    ]
+    await interaction.followup.send(
+        file=discord.File(simple_pdf(f"Relatorio de Farm - {FAC_NAME}", lines), filename="relatorio_farm.pdf"),
+        ephemeral=True
+    )
+
+# ============================================================
+# BACKUP
+# ============================================================
+
+async def create_backup(guild):
+    data = {
+        "name": guild.name,
+        "created_at": now_iso(),
+        "roles": [
+            {"name": r.name, "permissions": r.permissions.value, "color": r.color.value}
+            for r in guild.roles if not r.is_default() and not r.managed
+        ],
+        "categories": [{"name": c.name} for c in guild.categories],
+        "channels": [
+            {
+                "name": ch.name,
+                "type": "text" if isinstance(ch, discord.TextChannel) else "voice" if isinstance(ch, discord.VoiceChannel) else "other",
+                "category": ch.category.name if ch.category else None
+            }
+            for ch in guild.channels if not isinstance(ch, discord.CategoryChannel)
+        ],
+        "configs": {key: get_config(guild.id, key) for key in SYSTEMS}
+    }
+    path = BACKUP_DIR / f"{guild.id}.json"
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    return path
+
+@app_commands.command(name="backup", description="Cria backup da estrutura e configurações")
+async def backup_cmd(interaction: discord.Interaction):
+    if not is_admin(interaction.user):
+        return await deny(interaction)
+    await interaction.response.defer(ephemeral=True)
+    path = await create_backup(interaction.guild)
+    await interaction.followup.send(file=discord.File(path), ephemeral=True)
+
+@tasks.loop(hours=6)
+async def backup_loop():
+    for guild in bot.guilds:
+        try:
+            if not get_config(guild.id, "backup").get("auto_backup_enabled", True):
+                continue
+            await create_backup(guild)
+        except Exception:
+            traceback.print_exc()
+
+@backup_loop.before_loop
+async def before_backup():
+    await bot.wait_until_ready()
+
+# ============================================================
+# LOGS / SEGURANÇA
+# ============================================================
+
+spam = defaultdict(lambda: deque(maxlen=8))
+joins = defaultdict(lambda: deque(maxlen=15))
+
+@bot.event
+async def on_message(message):
+    if not message.guild or message.author.bot:
+        return
+    q = spam[(message.guild.id, message.author.id)]
+    q.append(time.monotonic())
+    scfg = get_config(message.guild.id, "seguranca")
+    spam_count = max(2, int(scfg.get("spam_count", 6)))
+    spam_window = max(1, int(scfg.get("spam_window", 5)))
+    spam_timeout = max(1, int(scfg.get("spam_timeout", 45)))
+    if scfg.get("anti_spam_enabled", True) and len(q) >= spam_count and q[-1] - q[-spam_count] <= spam_window:
+        try:
+            await message.author.timeout(
+                discord.utils.utcnow() + timedelta(seconds=spam_timeout),
+                reason="Anti-spam"
+            )
+        except Exception:
+            pass
+    await bot.process_commands(message)
+
+@bot.event
+async def on_member_join(member):
+    # Boas-vindas configurável
+    wcfg = get_config(member.guild.id, "boas_vindas")
+    if wcfg.get("enabled"):
+        text = str(wcfg.get("welcome_message", "Bem-vindo(a), {membro}!"))
+        text = text.replace("{membro}", member.mention).replace("{servidor}", member.guild.name)
+        try:
+            await member.send(embed=embed("🏠 Boas Vindas", text, GREEN, wcfg.get("embed_url", "")))
+        except Exception:
+            pass
+
+        public_cid = wcfg.get("welcome_channel_id")
+        if public_cid:
+            public_ch = member.guild.get_channel(int(public_cid))
+            if isinstance(public_ch, discord.TextChannel):
+                try:
+                    await public_ch.send(embed=embed("🏠 Boas Vindas", text, GREEN, wcfg.get("embed_url", "")))
+                except Exception:
+                    pass
+
+        await log_event(member.guild, "boas_vindas", "📥 Novo Membro", f"{member.mention} entrou no servidor.", GREEN)
+
+    q = joins[member.guild.id]
+    q.append(time.monotonic())
+    scfg = get_config(member.guild.id, "seguranca")
+    raid_count = max(2, int(scfg.get("raid_count", 10)))
+    raid_window = max(1, int(scfg.get("raid_window", 15)))
+    if scfg.get("anti_raid_enabled", True) and len(q) >= raid_count and q[-1] - q[-raid_count] <= raid_window:
+        await log_event(
+            member.guild,
+            "seguranca",
+            "🚨 Possível Raid Detectada",
+            f"{raid_count} ou mais membros entraram em aproximadamente {raid_window} segundos.",
+            RED
+        )
+
+@bot.event
+async def on_message_delete(message):
+    if not message.guild or message.author.bot:
+        return
+    # Usa primeiro canal de log configurado encontrado.
+    for key in SYSTEMS:
+        cfg = get_config(message.guild.id, key)
+        if cfg.get("log_channel_id"):
+            await log_event(
+                message.guild, key, "🗑️ Mensagem Apagada",
+                f"**Autor:** {message.author.mention}\n**Canal:** {message.channel.mention}\n"
+                f"**Conteúdo:** {(message.content or 'Sem texto')[:1200]}",
+                RED
+            )
+            break
+
+# ============================================================
+# COMANDOS PRINCIPAIS
+# ============================================================
+
+@bot.tree.command(name="gerenciar", description="Abre o painel de gerenciamento do Bot Facção")
+@app_commands.default_permissions(administrator=True)
+async def gerenciar(interaction: discord.Interaction):
+    if not is_admin(interaction.user):
+        return await deny(interaction)
+    await interaction.response.send_message(
+        view=DashboardLayout(1),
+        ephemeral=True
+    )
+
+@bot.tree.command(name="painel", description="Envia o painel público de um sistema")
+@app_commands.default_permissions(administrator=True)
+@app_commands.choices(sistema=[
+    app_commands.Choice(name=meta["label"], value=key)
+    for key, meta in SYSTEMS.items()
+])
+async def painel(interaction: discord.Interaction, sistema: app_commands.Choice[str], canal: discord.TextChannel):
+    if not is_admin(interaction.user):
+        return await deny(interaction)
+    await send_public_panel(interaction.guild, canal, sistema.value)
+    await interaction.response.send_message(
+        f"✅ Painel de **{SYSTEMS[sistema.value]['label']}** enviado em {canal.mention}.",
+        ephemeral=True
+    )
+
+@bot.tree.command(name="status-bot", description="Altera o status do bot")
+@app_commands.default_permissions(administrator=True)
+async def status_bot(interaction: discord.Interaction, texto: str):
+    if not is_admin(interaction.user):
+        return await deny(interaction)
+    await bot.change_presence(activity=discord.Game(name=texto))
+    await interaction.response.send_message("✅ Status atualizado.", ephemeral=True)
+
+@bot.tree.command(name="limpar", description="Limpa mensagens")
+async def limpar(interaction: discord.Interaction, quantidade: app_commands.Range[int,1,100] = 20):
+    if not interaction.user.guild_permissions.manage_messages:
+        return await deny(interaction)
+    await interaction.response.defer(ephemeral=True)
+    msgs = await interaction.channel.purge(limit=quantidade)
+    await interaction.followup.send(f"✅ {len(msgs)} mensagens removidas.", ephemeral=True)
+
+@bot.tree.command(name="anuncio-privado", description="Envia anúncio por DM para membros de um cargo")
+async def anuncio_privado(interaction: discord.Interaction, cargo: discord.Role, titulo: str, mensagem: str):
+    if not is_admin(interaction.user):
+        return await deny(interaction)
+    await interaction.response.defer(ephemeral=True)
+    sent = 0
+    failed = 0
+    e = embed(titulo, mensagem)
+    for member in cargo.members:
+        if member.bot:
+            continue
+        try:
+            await member.send(embed=e)
+            sent += 1
+            await asyncio.sleep(0.35)
+        except Exception:
+            failed += 1
+    await interaction.followup.send(f"✅ Enviados: {sent}\n❌ Falhas: {failed}", ephemeral=True)
+
+# Registra comandos que foram criados com @app_commands.command
+bot.tree.add_command(advertir)
+bot.tree.add_command(promover)
+bot.tree.add_command(rebaixar)
+bot.tree.add_command(ranking)
+bot.tree.add_command(relatorio_farm)
+bot.tree.add_command(backup_cmd)
+
+
+
+def _component_safety_audit():
+    """Falha cedo se um emoji textual conhecido por ser inválido voltar ao código."""
+    invalid_component_emojis = {"⏻", "←", "→"}
+    # Setas são permitidas em labels, mas não devem voltar ao parâmetro emoji.
+    source_markers = [
+        ("visitor_toggle", "🔄"),
+        ("toggle", "🔄"),
+    ]
+    for name, emoji in source_markers:
+        if emoji in invalid_component_emojis:
+            raise RuntimeError(f"Emoji inválido em componente: {name} -> {emoji}")
+
+_component_safety_audit()
+
+# ============================================================
+# STARTUP / READY
+# ============================================================
+
+_STARTUP_VIEWS_REGISTERED = False
+
+async def _setup_hook():
+    """Executa uma única vez por processo, antes da conexão ficar pronta.
+
+    Evita registrar views e sincronizar comandos novamente em cada reconexão
+    do Gateway, que era uma das fontes de instabilidade durante os testes.
+    """
+    global _STARTUP_VIEWS_REGISTERED
+
+    init_db()
+
+    if not _STARTUP_VIEWS_REGISTERED:
+        bot.add_view(RegistroPanel())
+        bot.add_view(VendasPanel())
+        bot.add_view(BancoPanel())
+        bot.add_view(LavagemPanel())
+        bot.add_view(EncomendasPanel())
+        bot.add_view(AusenciaPanel())
+        bot.add_view(FarmPanel())
+        bot.add_view(BauPanel())
+        bot.add_view(AcoesPanel())
+        bot.add_view(HierarquiaPanel())
+        bot.add_view(RankingPublicPanel())
+        _STARTUP_VIEWS_REGISTERED = True
+
+    if AUTO_SYNC_COMMANDS:
+        try:
+            if GUILD_ID.isdigit():
+                guild_obj = discord.Object(id=int(GUILD_ID))
+                bot.tree.copy_global_to(guild=guild_obj)
+                synced = await bot.tree.sync(guild=guild_obj)
+                print(f"✅ {len(synced)} comando(s) sincronizado(s) no servidor configurado.")
+            else:
+                synced = await bot.tree.sync()
+                print(f"✅ {len(synced)} comando(s) global(is) sincronizado(s).")
+        except discord.HTTPException as exc:
+            # Não despeja páginas HTML inteiras do Cloudflare no log.
+            print(
+                "⚠️ Falha temporária ao sincronizar comandos com o Discord: "
+                f"HTTP {getattr(exc, 'status', '?')} / código {getattr(exc, 'code', '?')}. "
+                "O bot continuará online; use /sincronizar quando a API normalizar."
+            )
+        except Exception as exc:
+            print(f"⚠️ Falha ao sincronizar comandos: {type(exc).__name__}: {exc}")
+
+# setup_hook é chamado uma vez pelo discord.py durante o login.
+bot.setup_hook = _setup_hook
+
+
+@bot.tree.command(name="sincronizar", description="Sincroniza os comandos do bot manualmente")
+@app_commands.default_permissions(administrator=True)
+async def sincronizar(interaction: discord.Interaction):
+    if not is_admin(interaction.user):
+        return await deny(interaction)
+
+    await interaction.response.defer(ephemeral=True)
+    try:
+        if GUILD_ID.isdigit():
+            guild_obj = discord.Object(id=int(GUILD_ID))
+            bot.tree.copy_global_to(guild=guild_obj)
+            synced = await bot.tree.sync(guild=guild_obj)
+        else:
+            synced = await bot.tree.sync()
+        await interaction.followup.send(
+            f"✅ **{len(synced)}** comando(s) sincronizado(s).",
+            ephemeral=True,
+        )
+    except discord.HTTPException as exc:
+        await interaction.followup.send(
+            f"⚠️ O Discord recusou temporariamente a sincronização (HTTP {getattr(exc, 'status', '?')}). "
+            "Aguarde alguns minutos e tente novamente.",
+            ephemeral=True,
+        )
+
+
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    # Resposta curta para o usuário e log legível no Railway.
+    original = getattr(error, "original", error)
+    print(f"❌ Erro em comando/interação: {type(original).__name__}: {original}")
+    try:
+        await deny(interaction, f"❌ Ocorreu um erro: `{type(original).__name__}`. Veja o log do Railway.")
+    except Exception:
+        pass
+
+
+@bot.event
+async def on_ready():
+    try:
+        if not backup_loop.is_running():
+            backup_loop.start()
+        await bot.change_presence(activity=discord.Game(name=f"Gerenciando {FAC_NAME}"))
+        print(f"✅ Online como {bot.user} | ID {bot.user.id if bot.user else 'N/A'}")
+    except Exception as exc:
+        print(f"⚠️ Erro no on_ready: {type(exc).__name__}: {exc}")
+
+
+bot.run(TOKEN)
