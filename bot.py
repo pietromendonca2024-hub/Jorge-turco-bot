@@ -163,6 +163,25 @@ SYSTEMS = {
         "public_title": "🎨 PERSONALIZAÇÃO", "public_description": "Sistema interno de personalização.",
         "has_public_panel": False,
     },
+    "metas": {
+        "label": "Metas Semanais", "emoji": "🎯",
+        "description": "Metas automáticas de farm, vendas e participação em ações.",
+        "public_title": "🎯 METAS DA SEMANA", "public_description": "Acompanhe seu progresso semanal.",
+        "has_public_panel": True,
+    },
+    "promocoes": {
+        "label": "Promoções", "emoji": "⬆️",
+        "description": "Análise de membros para auxiliar promoções da liderança.",
+        "public_title": "⬆️ ANÁLISE DE PROMOÇÕES", "public_description": "Sistema interno da liderança.",
+        "has_public_panel": False,
+    },
+    "inicio": {
+        "label": "Central de Início", "emoji": "👋",
+        "description": "Painel Comece Aqui integrado aos sistemas da facção.",
+        "public_title": "👋 COMECE AQUI", "public_description": "Tudo que um membro precisa para começar.",
+        "has_public_panel": True,
+    },
+
     "utilidades": {
         "label": "Utilidades", "emoji": "🧩",
         "description": "Configure embeds, anúncio privado, limpeza e central de ajuda.",
@@ -173,7 +192,7 @@ SYSTEMS = {
 
 DASHBOARD_PAGES = {
     1: ["boas_vindas", "registro", "vendas", "banco", "farm", "acoes", "hierarquia", "ausencia"],
-    2: ["lavagem", "encomendas", "bau", "advertencias", "ranking", "logs", "seguranca", "backup", "personalizacao", "utilidades"],
+    2: ["lavagem", "encomendas", "bau", "advertencias", "ranking", "metas", "promocoes", "inicio", "logs", "seguranca", "backup", "personalizacao", "utilidades"],
 }
 
 DEFAULTS = {
@@ -214,6 +233,11 @@ DEFAULTS = {
     "anti_spam_enabled": True,
     "anti_raid_enabled": True,
     "auto_backup_enabled": True,
+    "weekly_farm_goal": 500,
+    "weekly_sales_goal": 2000000,
+    "weekly_actions_goal": 3,
+    "rules_channel_id": None,
+    "hierarchy_channel_id": None,
 }
 
 # ============================================================
@@ -5363,6 +5387,10 @@ async def anuncio_privado(interaction: discord.Interaction, cargo: discord.Role,
 # Registra comandos que foram criados com @app_commands.command
 bot.tree.add_command(advertir)
 bot.tree.add_command(painel_advertencias)
+bot.tree.add_command(metas_cmd)
+bot.tree.add_command(configurar_metas)
+bot.tree.add_command(analisar_promocao)
+bot.tree.add_command(comece_aqui)
 bot.tree.add_command(painel_equipe)
 bot.tree.add_command(promover)
 bot.tree.add_command(rebaixar)
@@ -5412,6 +5440,8 @@ async def _setup_hook():
         bot.add_view(FarmPanel())
         bot.add_view(BauPanel())
         bot.add_view(AcoesPanel())
+        bot.add_view(MetasPanel())
+        bot.add_view(ComeceAquiView())
         bot.add_view(HierarquiaPanel())
         bot.add_view(RankingPublicPanel())
         _STARTUP_VIEWS_REGISTERED = True
