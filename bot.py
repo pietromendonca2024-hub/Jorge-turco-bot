@@ -1,9 +1,11 @@
 import os
-import asyncio
+import sqlite3
 import traceback
+from datetime import datetime
+
 import discord
-from discord.ext import commands
 from discord import app_commands
+from discord.ext import commands
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -12,36 +14,56 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 GUILD_ID = os.getenv("GUILD_ID")
 
 if not TOKEN:
-    raise RuntimeError("Configure DISCORD_TOKEN no arquivo .env")
+    raise RuntimeError("Configure DISCORD_TOKEN nas variáveis do Railway ou no .env")
 
 intents = discord.Intents.default()
+intents.members = True
+intents.message_content = True
+
 bot = commands.Bot(command_prefix="!", intents=intents)
+
+DB_PATH = "faccao.db"
+
+# =========================================================
+# CONFIGURAÇÃO
+# =========================================================
 
 ROLES = [
     ("👑 Dono", discord.Permissions(administrator=True)),
     ("👑 Sub-Dono", discord.Permissions(
-        manage_guild=True,
-        manage_channels=True,
-        manage_roles=True,
-        kick_members=True
+        manage_guild=True, manage_channels=True, manage_roles=True,
+        kick_members=True, ban_members=True, moderate_members=True,
+        manage_messages=True
     )),
     ("⚜️ Gerente", discord.Permissions(
-        manage_messages=True,
-        moderate_members=True
+        manage_channels=True, manage_messages=True,
+        moderate_members=True, kick_members=True
     )),
     ("🔱 Líder", discord.Permissions(
-        manage_messages=True,
-        moderate_members=True
+        manage_messages=True, moderate_members=True
     )),
-    ("🛡️ Sub-Líder", discord.Permissions(manage_messages=True)),
-    ("💼 Gerente de Farm", discord.Permissions(manage_messages=True)),
-    ("🎯 Gerente de Ação", discord.Permissions(manage_messages=True)),
+    ("🛡️ Sub-Líder", discord.Permissions(
+        manage_messages=True
+    )),
+    ("💼 Gerente de Farm", discord.Permissions(
+        manage_messages=True
+    )),
+    ("🎯 Gerente de Ação", discord.Permissions(
+        manage_messages=True
+    )),
     ("🔴 Membro", discord.Permissions()),
     ("🆕 Recruta", discord.Permissions()),
     ("💤 Ausente", discord.Permissions()),
     ("🤝 Parceiro", discord.Permissions()),
     ("👤 Visitante", discord.Permissions()),
 ]
+
+LEADERSHIP_NAMES = {
+    "👑 Dono", "👑 Sub-Dono", "⚜️ Gerente", "🔱 Líder", "🛡️ Sub-Líder"
+}
+
+FARM_MANAGER_NAMES = LEADERSHIP_NAMES | {"💼 Gerente de Farm"}
+ACTION_MANAGER_NAMES = LEADERSHIP_NAMES | {"🎯 Gerente de Ação"}
 
 STRUCTURE = {
     "📌・INFORMAÇÕES": [
@@ -122,129 +144,358 @@ STRUCTURE = {
     ],
 }
 
-PRIVATE_CATEGORIES = {"👑・LIDERANÇA", "🛡️・LOGS"}
+
+# =========================================================
+# BANCO DE DADOS
+# =========================================================
+
+def db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 
-async def get_or_create_role(guild: discord.Guild, name: str, permissions: discord.Permissions):
-    role = discord.utils.get(guild.roles, name=name)
+def init_db():
+    conn = db()
+    cur = conn.cursor()
 
-    if role is None:
-        role = await guild.create_role(
-            name=name,
-            permissions=permissions,
-            reason="Setup Jorge Turco"
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS registros (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            discord_id INTEGER NOT NULL,
+            nome TEXT NOT NULL,
+            passaporte TEXT,
+            telefone TEXT,
+            recrutador TEXT,
+            status TEXT DEFAULT 'pendente',
+            aprovado_por INTEGER,
+            criado_em TEXT NOT NULL
         )
+    """)
 
-    return role
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS advertencias (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            membro_id INTEGER NOT NULL,
+            motivo TEXT NOT NULL,
+            autor_id INTEGER NOT NULL,
+            criado_em TEXT NOT NULL
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS farms (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            membro_id INTEGER NOT NULL,
+            item TEXT NOT NULL,
+            quantidade INTEGER NOT NULL,
+            status TEXT DEFAULT 'pendente',
+            aprovado_por INTEGER,
+            criado_em TEXT NOT NULL
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS ausencias (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            membro_id INTEGER NOT NULL,
+            motivo TEXT NOT NULL,
+            periodo TEXT NOT NULL,
+            status TEXT DEFAULT 'pendente',
+            aprovado_por INTEGER,
+            criado_em TEXT NOT NULL
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS financeiro (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tipo TEXT NOT NULL,
+            membro_id INTEGER,
+            valor REAL NOT NULL,
+            descricao TEXT,
+            autor_id INTEGER NOT NULL,
+            criado_em TEXT NOT NULL
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS acoes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            titulo TEXT NOT NULL,
+            horario TEXT NOT NULL,
+            descricao TEXT,
+            autor_id INTEGER NOT NULL,
+            resultado TEXT,
+            criado_em TEXT NOT NULL
+        )
+    """)
+
+    conn.commit()
+    conn.close()
 
 
-async def wipe_server(guild: discord.Guild):
-    """
-    Apaga canais/categorias e cargos deletáveis do servidor.
+# =========================================================
+# HELPERS
+# =========================================================
 
-    Não é possível apagar:
-    - @everyone
-    - cargos gerenciados por bots/integrações
-    - o próprio cargo gerenciado do bot
-    - cargos acima do cargo mais alto do bot
-    """
-    removed_channels = 0
-    removed_roles = 0
-    skipped_roles = []
+def now():
+    return datetime.now().strftime("%d/%m/%Y %H:%M")
 
-    # Apaga canais primeiro. Categorias desaparecem quando apagadas explicitamente
-    # depois, caso ainda existam.
-    for channel in list(guild.channels):
+
+def get_channel(guild: discord.Guild, name: str):
+    return discord.utils.get(guild.text_channels, name=name)
+
+
+def has_any_role(member: discord.Member, names: set[str]) -> bool:
+    if member.guild_permissions.administrator:
+        return True
+    return any(role.name in names for role in member.roles)
+
+
+async def safe_send(channel, *args, **kwargs):
+    if channel:
         try:
-            await channel.delete(reason="Reset completo Jorge Turco")
-            removed_channels += 1
-            await asyncio.sleep(0.15)
-        except (discord.Forbidden, discord.HTTPException):
+            return await channel.send(*args, **kwargs)
+        except discord.HTTPException:
             pass
 
-    # Atualiza cache básico após as exclusões.
-    await asyncio.sleep(1)
 
-    me = guild.me
-    bot_top_role = me.top_role if me else None
+async def log(guild: discord.Guild, channel_name: str, title: str, description: str):
+    channel = get_channel(guild, channel_name)
+    if not channel:
+        return
+    embed = discord.Embed(
+        title=title,
+        description=description,
+        timestamp=datetime.now()
+    )
+    await safe_send(channel, embed=embed)
 
-    # Do cargo mais alto para o mais baixo.
-    for role in sorted(guild.roles, key=lambda r: r.position, reverse=True):
-        if role.is_default():
-            continue
 
-        if role.managed:
-            skipped_roles.append(role.name)
-            continue
+async def ensure_roles(guild: discord.Guild):
+    roles = {}
+    for name, perms in ROLES:
+        role = discord.utils.get(guild.roles, name=name)
+        if role is None:
+            role = await guild.create_role(
+                name=name,
+                permissions=perms,
+                reason="Setup Bot Facção Pro"
+            )
+        roles[name] = role
+    return roles
 
-        if bot_top_role is not None and role >= bot_top_role:
-            skipped_roles.append(role.name)
-            continue
 
-        try:
-            await role.delete(reason="Reset completo Jorge Turco")
-            removed_roles += 1
-            await asyncio.sleep(0.15)
-        except (discord.Forbidden, discord.HTTPException):
-            skipped_roles.append(role.name)
+def overwrites_for_category(guild: discord.Guild, roles: dict, category_name: str):
+    everyone = guild.default_role
 
-    return removed_channels, removed_roles, skipped_roles
+    member = roles["🔴 Membro"]
+    recruit = roles["🆕 Recruta"]
+    visitor = roles["👤 Visitante"]
+    partner = roles["🤝 Parceiro"]
+    absent = roles["💤 Ausente"]
+
+    leadership = [roles[n] for n in LEADERSHIP_NAMES]
+    farm_managers = [roles[n] for n in FARM_MANAGER_NAMES]
+    action_managers = [roles[n] for n in ACTION_MANAGER_NAMES]
+
+    def deny_all():
+        return {everyone: discord.PermissionOverwrite(view_channel=False)}
+
+    # Informação: todos veem, apenas liderança fala nos principais canais.
+    if category_name == "📌・INFORMAÇÕES":
+        ow = {
+            everyone: discord.PermissionOverwrite(view_channel=True),
+            visitor: discord.PermissionOverwrite(view_channel=True),
+            recruit: discord.PermissionOverwrite(view_channel=True),
+            member: discord.PermissionOverwrite(view_channel=True),
+        }
+        return ow
+
+    # Comunidade para membros/recrutas/parceiros.
+    if category_name == "🏘️・COMUNIDADE":
+        ow = deny_all()
+        for role in [member, recruit, partner, absent] + leadership:
+            ow[role] = discord.PermissionOverwrite(
+                view_channel=True,
+                send_messages=True,
+                read_message_history=True
+            )
+        return ow
+
+    # Registro: visitante e recruta conseguem acessar.
+    if category_name == "📝・REGISTRO":
+        ow = deny_all()
+        for role in [visitor, recruit, member] + leadership:
+            ow[role] = discord.PermissionOverwrite(
+                view_channel=True,
+                read_message_history=True
+            )
+        return ow
+
+    # Farm: membros veem, gerência aprova.
+    if category_name == "📦・FARM":
+        ow = deny_all()
+        for role in [member, recruit, absent]:
+            ow[role] = discord.PermissionOverwrite(
+                view_channel=True,
+                send_messages=True,
+                read_message_history=True
+            )
+        for role in farm_managers:
+            ow[role] = discord.PermissionOverwrite(
+                view_channel=True,
+                send_messages=True,
+                manage_messages=True,
+                read_message_history=True
+            )
+        return ow
+
+    # Gestão: liderança.
+    if category_name == "💰・GESTÃO":
+        ow = deny_all()
+        for role in leadership:
+            ow[role] = discord.PermissionOverwrite(
+                view_channel=True,
+                send_messages=True,
+                read_message_history=True
+            )
+        return ow
+
+    # Ações: membros veem; gerentes de ação gerenciam.
+    if category_name == "🎯・AÇÕES":
+        ow = deny_all()
+        for role in [member, recruit, absent]:
+            ow[role] = discord.PermissionOverwrite(
+                view_channel=True,
+                send_messages=True,
+                read_message_history=True
+            )
+        for role in action_managers:
+            ow[role] = discord.PermissionOverwrite(
+                view_channel=True,
+                send_messages=True,
+                manage_messages=True,
+                read_message_history=True
+            )
+        return ow
+
+    # Ausência: membros podem solicitar.
+    if category_name == "💤・AUSÊNCIA":
+        ow = deny_all()
+        for role in [member, recruit, absent] + leadership:
+            ow[role] = discord.PermissionOverwrite(
+                view_channel=True,
+                send_messages=True,
+                read_message_history=True
+            )
+        return ow
+
+    # Liderança e logs: só liderança.
+    if category_name in {"👑・LIDERANÇA", "🛡️・LOGS"}:
+        ow = deny_all()
+        for role in leadership:
+            ow[role] = discord.PermissionOverwrite(
+                view_channel=True,
+                send_messages=True,
+                read_message_history=True
+            )
+        return ow
+
+    # Calls: membros/recrutas/liderança.
+    if category_name == "🔊・CALLS":
+        ow = deny_all()
+        for role in [member, recruit, partner, absent] + leadership:
+            ow[role] = discord.PermissionOverwrite(
+                view_channel=True,
+                connect=True,
+                speak=True
+            )
+        return ow
+
+    return None
+
+
+async def configure_special_channels(guild: discord.Guild, roles: dict):
+    everyone = guild.default_role
+
+    # Canais de anúncios/regras: somente liderança fala.
+    for name in ["📜・regras", "📢・anúncios", "📋・informações", "🎭・hierarquia"]:
+        channel = get_channel(guild, name)
+        if channel:
+            await channel.set_permissions(everyone, view_channel=True, send_messages=False)
+            for role_name in LEADERSHIP_NAMES:
+                await channel.set_permissions(
+                    roles[role_name],
+                    view_channel=True,
+                    send_messages=True,
+                    read_message_history=True
+                )
+
+    # Pendências de registro privadas.
+    pending = get_channel(guild, "⏳・registros-pendentes")
+    if pending:
+        await pending.set_permissions(everyone, view_channel=False)
+        for role_name in LEADERSHIP_NAMES:
+            await pending.set_permissions(
+                roles[role_name],
+                view_channel=True,
+                send_messages=True,
+                read_message_history=True
+            )
+
+    # Aprovação de farm privada para gerentes.
+    pending_farm = get_channel(guild, "⏳・aprovação-farm")
+    if pending_farm:
+        await pending_farm.set_permissions(everyone, view_channel=False)
+        for role_name in FARM_MANAGER_NAMES:
+            await pending_farm.set_permissions(
+                roles[role_name],
+                view_channel=True,
+                send_messages=True,
+                read_message_history=True
+            )
+
+    # Aprovação de ausência privada.
+    pending_absence = get_channel(guild, "⏳・aprovação-ausência")
+    if pending_absence:
+        await pending_absence.set_permissions(everyone, view_channel=False)
+        for role_name in LEADERSHIP_NAMES:
+            await pending_absence.set_permissions(
+                roles[role_name],
+                view_channel=True,
+                send_messages=True,
+                read_message_history=True
+            )
 
 
 async def build_server(guild: discord.Guild):
-    roles = {}
-
-    for name, perms in ROLES:
-        roles[name] = await get_or_create_role(guild, name, perms)
-
-    leadership = [
-        roles[n]
-        for n in [
-            "👑 Dono",
-            "👑 Sub-Dono",
-            "⚜️ Gerente",
-            "🔱 Líder",
-            "🛡️ Sub-Líder",
-        ]
-    ]
-
+    roles = await ensure_roles(guild)
     created = []
 
     for category_name, channels in STRUCTURE.items():
         category = discord.utils.get(guild.categories, name=category_name)
+        ow = overwrites_for_category(guild, roles, category_name)
 
         if category is None:
-            # Não passa overwrites=None. Em algumas versões isso pode causar TypeError.
-            if category_name in PRIVATE_CATEGORIES:
-                overwrites = {
-                    guild.default_role: discord.PermissionOverwrite(
-                        view_channel=False
-                    )
-                }
-
-                for role in leadership:
-                    overwrites[role] = discord.PermissionOverwrite(
-                        view_channel=True,
-                        send_messages=True,
-                        read_message_history=True,
-                    )
-
+            if ow:
                 category = await guild.create_category(
                     category_name,
-                    overwrites=overwrites,
-                    reason="Setup Jorge Turco"
+                    overwrites=ow,
+                    reason="Setup Bot Facção Pro"
                 )
             else:
                 category = await guild.create_category(
                     category_name,
-                    reason="Setup Jorge Turco"
+                    reason="Setup Bot Facção Pro"
                 )
-
             created.append(category_name)
+        elif ow:
+            await category.edit(overwrites=ow, reason="Atualizando permissões Facção Pro")
 
         for channel_name, kind in channels:
             existing = discord.utils.get(category.channels, name=channel_name)
-
             if existing:
                 continue
 
@@ -252,201 +503,117 @@ async def build_server(guild: discord.Guild):
                 await guild.create_voice_channel(
                     channel_name,
                     category=category,
-                    reason="Setup Jorge Turco"
+                    reason="Setup Bot Facção Pro"
                 )
             else:
                 await guild.create_text_channel(
                     channel_name,
                     category=category,
-                    reason="Setup Jorge Turco"
+                    reason="Setup Bot Facção Pro"
                 )
-
             created.append(channel_name)
 
+    await configure_special_channels(guild, roles)
     return created
 
 
-class ConfirmSetup(discord.ui.View):
-    def __init__(self, author_id: int, full_reset: bool = False):
-        super().__init__(timeout=60)
-        self.author_id = author_id
-        self.full_reset = full_reset
+# =========================================================
+# REGISTRO
+# =========================================================
 
-    @discord.ui.button(
-        label="CONFIRMAR",
-        style=discord.ButtonStyle.danger,
-        emoji="⚠️"
-    )
-    async def confirm(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button
-    ):
-        if interaction.user.id != self.author_id:
-            return await interaction.response.send_message(
-                "Somente quem executou o comando pode confirmar.",
-                ephemeral=True
+class RegistroModal(discord.ui.Modal, title="Registro na Facção"):
+    nome = discord.ui.TextInput(label="Nome / Vulgo", max_length=40)
+    passaporte = discord.ui.TextInput(label="Passaporte / ID", max_length=20)
+    telefone = discord.ui.TextInput(label="Telefone", required=False, max_length=30)
+    recrutador = discord.ui.TextInput(label="Quem te recrutou?", required=False, max_length=40)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        conn = db()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO registros
+            (discord_id, nome, passaporte, telefone, recrutador, criado_em)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                interaction.user.id,
+                str(self.nome),
+                str(self.passaporte),
+                str(self.telefone),
+                str(self.recrutador),
+                now()
             )
-
-        if not interaction.user.guild_permissions.administrator:
-            return await interaction.response.send_message(
-                "Você precisa ser administrador.",
-                ephemeral=True
-            )
-
-        guild = interaction.guild
-
-        if guild is None:
-            return await interaction.response.send_message(
-                "Este comando só funciona dentro de um servidor.",
-                ephemeral=True
-            )
-
-        # Responde antes de apagar os canais, pois o canal atual pode ser deletado.
-        if self.full_reset:
-            await interaction.response.edit_message(
-                content=(
-                    "⚠️ **RESET INICIADO.**\n"
-                    "Os canais e cargos deletáveis serão apagados e a estrutura será criada do zero.\n"
-                    "A mensagem pode desaparecer quando este canal for excluído."
-                ),
-                embed=None,
-                view=None
-            )
-        else:
-            await interaction.response.edit_message(
-                content="Criando a estrutura da **JORGE TURCO**...",
-                embed=None,
-                view=None
-            )
-
-        try:
-            removed_channels = 0
-            removed_roles = 0
-            skipped_roles = []
-
-            if self.full_reset:
-                removed_channels, removed_roles, skipped_roles = await wipe_server(guild)
-
-            created = await build_server(guild)
-
-            # Como o canal original pode ter sido apagado, manda o resultado
-            # no novo canal de comandos ou no chat-geral.
-            target = discord.utils.get(guild.text_channels, name="🤖・comandos")
-            if target is None:
-                target = discord.utils.get(guild.text_channels, name="💬・chat-geral")
-
-            if target is not None:
-                text = (
-                    "✅ **SETUP CONCLUÍDO!**\n"
-                    f"• Canais/categorias removidos: **{removed_channels}**\n"
-                    f"• Cargos removidos: **{removed_roles}**\n"
-                    f"• Itens criados: **{len(created)}**"
-                )
-
-                if skipped_roles:
-                    text += (
-                        "\n\n⚠️ Alguns cargos não puderam ser apagados "
-                        "porque são gerenciados ou estão acima do cargo do bot:\n"
-                        + ", ".join(skipped_roles[:15])
-                    )
-
-                await target.send(text)
-
-        except discord.Forbidden:
-            traceback.print_exc()
-
-            target = discord.utils.get(guild.text_channels, name="🤖・comandos")
-            if target:
-                await target.send(
-                    "❌ O bot não possui permissões suficientes. "
-                    "Dê **Administrador** ao bot e coloque o cargo dele acima dos cargos que deseja apagar/criar."
-                )
-
-        except Exception as e:
-            traceback.print_exc()
-
-            target = discord.utils.get(guild.text_channels, name="🤖・comandos")
-            if target:
-                await target.send(
-                    f"❌ Erro durante o setup:\n```{type(e).__name__}: {e}```"
-                )
-
-
-@bot.event
-async def on_ready():
-    try:
-        if GUILD_ID and GUILD_ID.isdigit():
-            guild_obj = discord.Object(id=int(GUILD_ID))
-            bot.tree.copy_global_to(guild=guild_obj)
-            await bot.tree.sync(guild=guild_obj)
-        else:
-            await bot.tree.sync()
-
-        print(f"Online como {bot.user}")
-
-    except Exception as e:
-        print("Erro sincronizando comandos:", e)
-        traceback.print_exc()
-
-
-@bot.tree.command(
-    name="setup-servidor",
-    description="Cria a estrutura da Jorge Turco sem apagar o servidor"
-)
-@app_commands.default_permissions(administrator=True)
-@app_commands.guild_only()
-async def setup_servidor(interaction: discord.Interaction):
-    embed = discord.Embed(
-        title="JORGE TURCO • Setup do Servidor",
-        description=(
-            "Este modo cria os **cargos, categorias, canais, calls e áreas privadas** "
-            "sem apagar o que já existe.\n\n"
-            "Use `/reset-servidor` se quiser apagar os canais e cargos deletáveis "
-            "e montar tudo do zero."
         )
-    )
+        registro_id = cur.lastrowid
+        conn.commit()
+        conn.close()
 
-    embed.set_footer(
-        text="Execute apenas em um servidor onde você tenha permissão."
-    )
+        embed = discord.Embed(
+            title=f"📝 Novo Registro #{registro_id}",
+            description=f"Solicitação enviada por {interaction.user.mention}"
+        )
+        embed.add_field(name="Nome / Vulgo", value=str(self.nome), inline=False)
+        embed.add_field(name="Passaporte / ID", value=str(self.passaporte), inline=True)
+        embed.add_field(name="Telefone", value=str(self.telefone) or "Não informado", inline=True)
+        embed.add_field(name="Recrutador", value=str(self.recrutador) or "Não informado", inline=False)
 
-    await interaction.response.send_message(
-        embed=embed,
-        view=ConfirmSetup(interaction.user.id, full_reset=False),
-        ephemeral=True
-    )
+        pending = get_channel(interaction.guild, "⏳・registros-pendentes")
+        if pending:
+            await pending.send(
+                embed=embed,
+                view=RegistroApprovalView(registro_id, interaction.user.id)
+            )
 
-
-@bot.tree.command(
-    name="reset-servidor",
-    description="APAGA canais/cargos deletáveis e recria a Jorge Turco do zero"
-)
-@app_commands.default_permissions(administrator=True)
-@app_commands.guild_only()
-async def reset_servidor(interaction: discord.Interaction):
-    embed = discord.Embed(
-        title="⚠️ JORGE TURCO • RESET COMPLETO",
-        description=(
-            "**ATENÇÃO: ESTA AÇÃO É DESTRUTIVA.**\n\n"
-            "Ao confirmar, o bot tentará apagar:\n"
-            "• todos os canais e categorias;\n"
-            "• todos os cargos que ele tiver permissão para excluir;\n\n"
-            "Depois, criará toda a estrutura da JORGE TURCO do zero.\n\n"
-            "**Não há desfazer automático.**"
-        ),
-        color=discord.Color.red()
-    )
-
-    embed.set_footer(
-        text="O @everyone e cargos gerenciados por bots/integrações não podem ser apagados."
-    )
-
-    await interaction.response.send_message(
-        embed=embed,
-        view=ConfirmSetup(interaction.user.id, full_reset=True),
-        ephemeral=True
-    )
+        await interaction.response.send_message(
+            "✅ Seu registro foi enviado para análise.",
+            ephemeral=True
+        )
 
 
-bot.run(TOKEN)
+class RegistroApprovalView(discord.ui.View):
+    def __init__(self, registro_id: int, user_id: int):
+        super().__init__(timeout=None)
+        self.registro_id = registro_id
+        self.user_id = user_id
+
+    @discord.ui.button(label="Aprovar", style=discord.ButtonStyle.success, emoji="✅")
+    async def approve(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not has_any_role(interaction.user, LEADERSHIP_NAMES):
+            return await interaction.response.send_message("Sem permissão.", ephemeral=True)
+
+        member = interaction.guild.get_member(self.user_id)
+        role_member = discord.utils.get(interaction.guild.roles, name="🔴 Membro")
+        role_recruit = discord.utils.get(interaction.guild.roles, name="🆕 Recruta")
+        role_visitor = discord.utils.get(interaction.guild.roles, name="👤 Visitante")
+
+        if member:
+            if role_member:
+                await member.add_roles(role_member, reason="Registro aprovado")
+            for role in [role_recruit, role_visitor]:
+                if role and role in member.roles:
+                    await member.remove_roles(role, reason="Registro aprovado")
+
+        conn = db()
+        conn.execute(
+            "UPDATE registros SET status='aprovado', aprovado_por=? WHERE id=?",
+            (interaction.user.id, self.registro_id)
+        )
+        conn.commit()
+        conn.close()
+
+        await interaction.response.edit_message(
+            content=f"✅ Registro aprovado por {interaction.user.mention}",
+            embed=interaction.message.embeds[0] if interaction.message.embeds else None,
+            view=None
+        )
+
+        welcome = get_channel(interaction.guild, "👋・boas-vindas")
+        if welcome and member:
+            await welcome.send(f"👋 Bem-vindo à facção, {member.mention}!")
+
+        await log(
+            interaction.guild,
+            "👥・logs-membros",
+            "✅ Registro aprovado",
+         
