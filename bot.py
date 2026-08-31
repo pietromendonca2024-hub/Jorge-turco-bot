@@ -5695,6 +5695,301 @@ async def comece_aqui(interaction: discord.Interaction):
     )
 
 
+
+# ============================================================
+# AUTO-CONFIGURAÇÃO DO SERVIDOR
+# Usa nomes dos canais/cargos existentes, sem criar nada.
+# Gerente é o principal cargo de liberação.
+# ============================================================
+
+def _norm_discord_name(value: str) -> str:
+    import unicodedata
+    value = unicodedata.normalize("NFKD", str(value or ""))
+    value = "".join(ch for ch in value if not unicodedata.combining(ch))
+    return "".join(ch.lower() for ch in value if ch.isalnum())
+
+
+def _find_text_channel_by_names(guild: discord.Guild, *names):
+    targets = {_norm_discord_name(n) for n in names if n}
+    for ch in guild.text_channels:
+        if _norm_discord_name(ch.name) in targets:
+            return ch
+    return None
+
+
+def _find_role_by_names(guild: discord.Guild, *names):
+    targets = {_norm_discord_name(n) for n in names if n}
+    for role in guild.roles:
+        if _norm_discord_name(role.name) in targets:
+            return role
+    return None
+
+
+def _role_ids(*roles):
+    return [r.id for r in roles if r is not None]
+
+
+def apply_server_autoconfig(guild: discord.Guild):
+    """Mapeia os canais/cargos já existentes no servidor para os sistemas do bot.
+
+    Não cria nem apaga canais/cargos. Só atualiza IDs de configuração.
+    """
+    # -------- Cargos --------
+    dono = _find_role_by_names(guild, "👑 Dono", "Dono")
+    sub_dono = _find_role_by_names(guild, "👑 Sub-Dono", "Sub-Dono")
+    lider = _find_role_by_names(guild, "🔱 Líder", "Líder", "Lider")
+    sub_lider = _find_role_by_names(guild, "🛡️ Sub-Líder", "Sub-Líder", "Sub-Lider")
+    gerente = _find_role_by_names(guild, "⚜️ Gerente", "Gerente")
+    gerente_acao = _find_role_by_names(guild, "🎯 Gerente de Ação", "Gerente de Ação", "Gerente de Acao")
+    gerente_farm = _find_role_by_names(guild, "💼 Gerente de Farm", "Gerente de Farm")
+    membro = _find_role_by_names(guild, "🔴 Membro", "Membro")
+    recruta = _find_role_by_names(guild, "🆕 Recruta", "Recruta")
+    visitante = _find_role_by_names(guild, "👤 Visitante", "Visitante")
+    ausente = _find_role_by_names(guild, "💤 Ausente", "Ausente")
+
+    # Gerente é o principal liberador. Cargos superiores também entram.
+    gestao = _role_ids(gerente, sub_lider, lider, sub_dono, dono)
+    lideranca = _role_ids(sub_lider, lider, sub_dono, dono)
+    aprovadores = _role_ids(gerente, sub_lider, lider, sub_dono, dono)
+    farm_staff = _role_ids(gerente_farm, gerente, sub_lider, lider, sub_dono, dono)
+    action_staff = _role_ids(gerente_acao, gerente, sub_lider, lider, sub_dono, dono)
+
+    # -------- Canais --------
+    canais = {
+        "regras": _find_text_channel_by_names(guild, "📜・regras", "📜 regras", "regras"),
+        "anuncios": _find_text_channel_by_names(guild, "📢・anúncios", "📢・anuncios", "anúncios", "anuncios"),
+        "informacoes": _find_text_channel_by_names(guild, "📋・informações", "📋・informacoes", "informações", "informacoes"),
+        "hierarquia": _find_text_channel_by_names(guild, "🎭・hierarquia", "hierarquia"),
+        "comandos": _find_text_channel_by_names(guild, "🤖・comandos", "comandos"),
+
+        "registro": _find_text_channel_by_names(guild, "📝・registro", "registro"),
+        "registros_pendentes": _find_text_channel_by_names(guild, "⏳・registros-pendentes", "registros-pendentes"),
+        "visitantes": _find_text_channel_by_names(guild, "👤・visitantes", "visitantes"),
+        "boas_vindas": _find_text_channel_by_names(guild, "👋・boas-vindas", "boas-vindas"),
+
+        "painel_farm": _find_text_channel_by_names(guild, "📦・painel-farm", "painel-farm"),
+        "aprovacao_farm": _find_text_channel_by_names(guild, "⏳・aprovação-farm", "⏳・aprovacao-farm", "aprovação-farm", "aprovacao-farm"),
+        "ranking_farm": _find_text_channel_by_names(guild, "🏆・ranking-farm", "ranking-farm"),
+        "metas": _find_text_channel_by_names(guild, "🎯・metas", "metas"),
+        "relatorios_farm": _find_text_channel_by_names(guild, "📊・relatórios-farm", "📊・relatorios-farm", "relatórios-farm", "relatorios-farm"),
+
+        "estoque": _find_text_channel_by_names(guild, "📦・estoque", "estoque"),
+        "bau_lideranca": _find_text_channel_by_names(guild, "🔐・baú-liderança", "🔐・bau-lideranca", "baú-liderança", "bau-lideranca"),
+        "banco": _find_text_channel_by_names(guild, "🏦・banco", "banco"),
+        "vendas": _find_text_channel_by_names(guild, "💵・vendas", "vendas"),
+        "encomendas": _find_text_channel_by_names(guild, "📋・encomendas", "encomendas"),
+        "lavagem": _find_text_channel_by_names(guild, "💸・lavagem", "lavagem"),
+        "ranking_geral": _find_text_channel_by_names(guild, "📊・ranking-geral", "ranking-geral"),
+
+        "painel_acoes": _find_text_channel_by_names(guild, "📋・painel-ações", "📋・painel-acoes", "painel-ações", "painel-acoes"),
+        "acoes_marcadas": _find_text_channel_by_names(guild, "📅・ações-marcadas", "📅・acoes-marcadas", "ações-marcadas", "acoes-marcadas"),
+        "resultados": _find_text_channel_by_names(guild, "📸・resultados", "resultados"),
+        "ranking_acoes": _find_text_channel_by_names(guild, "🏆・ranking-ações", "🏆・ranking-acoes", "ranking-ações", "ranking-acoes"),
+
+        "solicitar_ausencia": _find_text_channel_by_names(guild, "📋・solicitar-ausência", "📋・solicitar-ausencia", "solicitar-ausência", "solicitar-ausencia"),
+        "aprovacao_ausencia": _find_text_channel_by_names(guild, "⏳・aprovação-ausência", "⏳・aprovacao-ausencia", "aprovação-ausência", "aprovacao-ausencia"),
+
+        "gerenciar_membros": _find_text_channel_by_names(guild, "👥・gerenciar-membros", "gerenciar-membros"),
+        "promocoes": _find_text_channel_by_names(guild, "⬆️・promoções-rebaixamentos", "⬆️・promocoes-rebaixamentos", "promoções-rebaixamentos", "promocoes-rebaixamentos"),
+        "advertencias": _find_text_channel_by_names(guild, "⚠️・advertências", "⚠️・advertencias", "advertências", "advertencias"),
+        "relatorios": _find_text_channel_by_names(guild, "📊・relatórios", "📊・relatorios", "relatórios", "relatorios"),
+        "anuncio_privado": _find_text_channel_by_names(guild, "📢・anúncio-privado", "📢・anuncio-privado", "anúncio-privado", "anuncio-privado"),
+        "criador_embeds": _find_text_channel_by_names(guild, "🎨・criador-de-embeds", "criador-de-embeds"),
+        "backups": _find_text_channel_by_names(guild, "💾・backups", "backups"),
+
+        "logs_gerais": _find_text_channel_by_names(guild, "📑・logs-gerais", "logs-gerais"),
+        "logs_membros": _find_text_channel_by_names(guild, "👥・logs-membros", "logs-membros"),
+        "logs_mensagens": _find_text_channel_by_names(guild, "💬・logs-mensagens", "logs-mensagens"),
+        "logs_voz": _find_text_channel_by_names(guild, "🔊・logs-voz", "logs-voz"),
+        "logs_cargos": _find_text_channel_by_names(guild, "🎭・logs-cargos", "logs-cargos"),
+        "logs_financeiro": _find_text_channel_by_names(guild, "💰・logs-financeiro", "logs-financeiro"),
+        "logs_farm": _find_text_channel_by_names(guild, "📦・logs-farm", "logs-farm"),
+        "logs_seguranca": _find_text_channel_by_names(guild, "🛡️・logs-segurança", "🛡️・logs-seguranca", "logs-segurança", "logs-seguranca"),
+    }
+
+    def cid(key):
+        ch = canais.get(key)
+        return ch.id if ch else None
+
+    # -------- Configurações dos sistemas --------
+    # Registro
+    update_config(
+        guild.id, "registro",
+        enabled=True,
+        public_channel_id=cid("registro"),
+        log_channel_id=cid("registros_pendentes") or cid("logs_membros"),
+        access_role_ids=gestao,
+        approver_role_ids=aprovadores,
+        approved_role_id=(membro.id if membro else None),
+        visitor_role_id=(visitante.id if visitante else None),
+    )
+
+    # Boas-vindas
+    update_config(
+        guild.id, "boas_vindas",
+        enabled=True,
+        welcome_channel_id=cid("boas_vindas"),
+        log_channel_id=cid("logs_membros"),
+        access_role_ids=gestao,
+    )
+
+    # Farm
+    update_config(
+        guild.id, "farm",
+        enabled=True,
+        public_channel_id=cid("painel_farm"),
+        log_channel_id=cid("logs_farm") or cid("aprovacao_farm"),
+        access_role_ids=farm_staff,
+        approver_role_ids=farm_staff,
+    )
+
+    # Ações
+    update_config(
+        guild.id, "acoes",
+        enabled=True,
+        public_channel_id=cid("painel_acoes"),
+        log_channel_id=cid("acoes_marcadas") or cid("logs_gerais"),
+        access_role_ids=action_staff,
+        approver_role_ids=action_staff,
+        action_ping_role_id=(gerente_acao.id if gerente_acao else gerente.id if gerente else None),
+    )
+
+    # Banco / Vendas / Lavagem / Encomendas / Baú
+    for system, public_key in (
+        ("banco", "banco"),
+        ("vendas", "vendas"),
+        ("lavagem", "lavagem"),
+        ("encomendas", "encomendas"),
+        ("bau", "estoque"),
+    ):
+        changes = {
+            "enabled": True,
+            "public_channel_id": cid(public_key),
+            "access_role_ids": gestao,
+        }
+        if system in {"encomendas"}:
+            changes["approver_role_ids"] = aprovadores
+        if system in {"banco", "vendas", "lavagem"}:
+            changes["log_channel_id"] = cid("logs_financeiro")
+        elif system == "bau":
+            changes["log_channel_id"] = cid("logs_gerais")
+            changes["leader_role_ids"] = lideranca
+        elif system == "encomendas":
+            changes["log_channel_id"] = cid("logs_gerais")
+        update_config(guild.id, system, **changes)
+
+    # Ausência
+    update_config(
+        guild.id, "ausencia",
+        enabled=True,
+        public_channel_id=cid("solicitar_ausencia"),
+        log_channel_id=cid("aprovacao_ausencia"),
+        access_role_ids=gestao,
+        approver_role_ids=aprovadores,
+    )
+
+    # Hierarquia / Ranking
+    hierarchy_ids = _role_ids(
+        dono, sub_dono, lider, sub_lider, gerente,
+        gerente_acao, gerente_farm, membro, recruta
+    )
+    update_config(
+        guild.id, "hierarquia",
+        enabled=True,
+        public_channel_id=cid("hierarquia"),
+        log_channel_id=cid("logs_cargos"),
+        access_role_ids=gestao,
+        hierarchy_role_ids=hierarchy_ids,
+    )
+    update_config(
+        guild.id, "ranking",
+        enabled=True,
+        public_channel_id=cid("ranking_geral"),
+        log_channel_id=cid("relatorios"),
+        access_role_ids=gestao,
+    )
+
+    # Advertências e promoções: Gerente é o principal liberador.
+    update_config(
+        guild.id, "advertencias",
+        enabled=True,
+        log_channel_id=cid("advertencias"),
+        access_role_ids=gestao,
+        approver_role_ids=aprovadores,
+    )
+    update_config(
+        guild.id, "promocoes",
+        enabled=True,
+        log_channel_id=cid("promocoes"),
+        access_role_ids=gestao,
+        approver_role_ids=aprovadores,
+    )
+
+    # Metas
+    update_config(
+        guild.id, "metas",
+        enabled=True,
+        public_channel_id=cid("metas"),
+        log_channel_id=cid("relatorios_farm") or cid("relatorios"),
+        access_role_ids=gestao,
+    )
+
+    # Comece Aqui - reaproveita canais existentes.
+    update_config(
+        guild.id, "inicio",
+        enabled=True,
+        public_channel_id=cid("informacoes") or cid("comandos"),
+        log_channel_id=cid("logs_gerais"),
+        access_role_ids=gestao,
+        rules_channel_id=cid("regras"),
+        hierarchy_channel_id=cid("hierarquia"),
+    )
+
+    # Logs / Segurança / Backup / Utilidades
+    update_config(
+        guild.id, "logs",
+        enabled=True,
+        log_channel_id=cid("logs_gerais"),
+        access_role_ids=gestao,
+    )
+    update_config(
+        guild.id, "seguranca",
+        enabled=True,
+        log_channel_id=cid("logs_seguranca") or cid("logs_gerais"),
+        access_role_ids=gestao,
+    )
+    update_config(
+        guild.id, "backup",
+        enabled=True,
+        log_channel_id=cid("backups"),
+        access_role_ids=gestao,
+    )
+    update_config(
+        guild.id, "utilidades",
+        enabled=True,
+        log_channel_id=cid("logs_gerais"),
+        access_role_ids=gestao,
+    )
+
+    # Personalização não é zerada; só garante acesso da gestão.
+    update_config(
+        guild.id, "personalizacao",
+        enabled=True,
+        access_role_ids=gestao,
+    )
+
+    found_channels = sum(1 for ch in canais.values() if ch is not None)
+    found_roles = sum(1 for r in [
+        dono, sub_dono, lider, sub_lider, gerente, gerente_acao,
+        gerente_farm, membro, recruta, visitante, ausente
+    ] if r is not None)
+    print(
+        f"✅ Auto-configuração aplicada em {guild.name}: "
+        f"{found_channels} canais encontrados, {found_roles} cargos encontrados. "
+        "Gerente definido como principal cargo de liberação."
+    )
+
+
 # ============================================================
 # COMANDOS PRINCIPAIS
 # ============================================================
@@ -5885,6 +6180,15 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
 @bot.event
 async def on_ready():
     try:
+        for guild in bot.guilds:
+            try:
+                apply_server_autoconfig(guild)
+            except Exception as cfg_exc:
+                print(
+                    f"⚠️ Falha na auto-configuração de {guild.name}: "
+                    f"{type(cfg_exc).__name__}: {cfg_exc}"
+                )
+
         if not backup_loop.is_running():
             backup_loop.start()
         await bot.change_presence(activity=discord.Game(name=f"Gerenciando {FAC_NAME}"))
