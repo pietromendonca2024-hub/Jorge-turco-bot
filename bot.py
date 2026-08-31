@@ -616,4 +616,3 @@ class RegistroApprovalView(discord.ui.View):
             interaction.guild,
             "👥・logs-membros",
             "✅ Registro aprovado",
-         
