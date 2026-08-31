@@ -882,8 +882,15 @@ class ConfigActionButton(discord.ui.Button):
             return await interaction.response.send_modal(URLModal(system))
 
         if action == "special":
+            special_view = SpecialOptionsView(system)
+            if not special_view.children:
+                return await interaction.response.send_message(
+                    "ℹ️ Este sistema não possui configurações específicas adicionais.",
+                    ephemeral=True,
+                )
             return await interaction.response.send_message(
-                view=SpecialOptionsView(system),
+                f"⚙️ **Configurações específicas — {SYSTEMS[system]['label']}**",
+                view=special_view,
                 ephemeral=True,
             )
 
@@ -1708,6 +1715,16 @@ class SpecialOptionsView(discord.ui.View):
             self.add_item(SpecialActionButton(system, "ranking_points", "Configurar Pontos", "⚙️"))
             self.add_item(SpecialActionButton(system, "ranking_preview", "Ver Ranking", "🏆"))
 
+        elif system == "metas":
+            self.add_item(SpecialActionButton(system, "metas_config", "Configurar Metas", "🎯"))
+            self.add_item(SpecialActionButton(system, "metas_rank", "Ranking Semanal", "🏆"))
+
+        elif system == "promocoes":
+            self.add_item(SpecialActionButton(system, "promocoes_info", "Como Funciona", "⬆️"))
+
+        elif system == "inicio":
+            self.add_item(SpecialActionButton(system, "inicio_preview", "Prévia do Comece Aqui", "👋"))
+
         elif system == "logs":
             self.add_item(SpecialActionButton(system, "logs_test", "Testar Canal de Logs", "🧪"))
 
@@ -2014,6 +2031,39 @@ class SpecialActionButton(discord.ui.Button):
         if action == "ranking_preview":
             return await interaction.response.send_message(
                 embed=await ranking_embed_for_guild(interaction.guild),
+                ephemeral=True
+            )
+
+        if action == "metas_config":
+            return await interaction.response.send_modal(WeeklyGoalsModal())
+
+        if action == "metas_rank":
+            return await interaction.response.send_message(
+                embed=weekly_ranking_embed(interaction.guild),
+                ephemeral=True
+            )
+
+        if action == "promocoes_info":
+            return await interaction.response.send_message(
+                embed=embed(
+                    "⬆️ Sistema de Promoções",
+                    (
+                        "A liderança pode usar **/analisar-promocao** e selecionar um membro.\n\n"
+                        "A análise considera **Farm**, **Vendas**, **participação em Ações**, "
+                        "**Ranking** e **Advertências ativas**.\n"
+                        "O bot apenas recomenda; a decisão continua com a liderança."
+                    ),
+                    guild_id=interaction.guild.id,
+                    use_theme_image=False,
+                    use_theme_thumbnail=True
+                ),
+                ephemeral=True
+            )
+
+        if action == "inicio_preview":
+            return await interaction.response.send_message(
+                embed=comece_aqui_embed(interaction.guild),
+                view=ComeceAquiView(),
                 ephemeral=True
             )
 
