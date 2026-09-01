@@ -190,6 +190,15 @@ SYSTEMS = {
     },
 }
 
+# Compatibilidade com configurações/bancos de versões anteriores.
+# Garante que o painel de Utilidades nunca gere KeyError mesmo após atualização.
+SYSTEMS.setdefault("utilidades", {
+    "label": "Utilidades", "emoji": "🧩",
+    "description": "Configure embeds, anúncio privado, limpeza e central de ajuda.",
+    "public_title": "🧩 UTILIDADES", "public_description": "Ferramentas administrativas.",
+    "has_public_panel": False,
+})
+
 DASHBOARD_PAGES = {
     1: ["boas_vindas", "registro", "vendas", "banco", "farm", "acoes", "hierarquia", "ausencia"],
     2: ["lavagem", "encomendas", "bau", "advertencias", "ranking", "metas", "promocoes"],
@@ -813,7 +822,7 @@ class DashboardLayout(discord.ui.LayoutView):
         # por LayoutView. Cada Section conta também seus componentes internos,
         # então não usamos um Separator após cada sistema.
         for system in DASHBOARD_PAGES[page]:
-            meta = SYSTEMS[system]
+            meta = SYSTEMS.get(system, {"label": str(system).title(), "emoji": "⚙️", "description": "Sistema administrativo.", "public_title": "⚙️ SISTEMA", "public_description": "Sistema administrativo.", "has_public_panel": False})
             text = f"**{meta['emoji']} Sistema de {meta['label']}**\n{meta['description']}"
             container.add_item(
                 discord.ui.Section(
@@ -889,13 +898,13 @@ class ConfigActionButton(discord.ui.Button):
                     ephemeral=True,
                 )
             return await interaction.response.send_message(
-                f"⚙️ **Configurações específicas — {SYSTEMS[system]['label']}**",
+                f"⚙️ **Configurações específicas — {SYSTEMS.get(system, {"label": str(system).title()})['label']}**",
                 view=special_view,
                 ephemeral=True,
             )
 
         if action == "panel":
-            if not SYSTEMS[system].get("has_public_panel"):
+            if not SYSTEMS.get(system, {}).get("has_public_panel"):
                 return await interaction.response.send_message(
                     "ℹ️ Este sistema é administrativo e não possui painel público.",
                     ephemeral=True,
@@ -924,7 +933,7 @@ class SystemConfigLayout(discord.ui.LayoutView):
         super().__init__(timeout=600)
         self.system = system
         self.page = page
-        meta = SYSTEMS[system]
+        meta = SYSTEMS.get(system, {"label": str(system).title(), "emoji": "⚙️", "description": "Sistema administrativo.", "public_title": "⚙️ SISTEMA", "public_description": "Sistema administrativo.", "has_public_panel": False})
 
         container = discord.ui.Container(accent_colour=discord.Colour.from_rgb(35, 38, 32))
         container.add_item(discord.ui.TextDisplay(
@@ -1011,7 +1020,7 @@ def system_config_lines_placeholder(system: str):
     # O LayoutView é construído antes de receber Interaction/Guild. A tela mostra
     # os controles; após cada alteração ela é reconstruída. O estado detalhado
     # é exibido na resposta das opções e no status visual dos controles.
-    meta = SYSTEMS[system]
+    meta = SYSTEMS.get(system, {"label": str(system).title(), "emoji": "⚙️", "description": "Sistema administrativo.", "public_title": "⚙️ SISTEMA", "public_description": "Sistema administrativo.", "has_public_panel": False})
     return f"Sistema: **{meta['label']}** • alterações salvas automaticamente."
 
 
@@ -2206,7 +2215,7 @@ class PanelChannelView(discord.ui.View):
 # ============================================================
 
 async def send_public_panel(guild, channel, system):
-    meta = SYSTEMS[system]
+    meta = SYSTEMS.get(system, {"label": str(system).title(), "emoji": "⚙️", "description": "Sistema administrativo.", "public_title": "⚙️ SISTEMA", "public_description": "Sistema administrativo.", "has_public_panel": False})
     cfg = get_config(guild.id, system)
     e = embed(
         meta["public_title"],
@@ -6015,7 +6024,7 @@ async def painel(interaction: discord.Interaction, sistema: app_commands.Choice[
         return await deny(interaction)
     await send_public_panel(interaction.guild, canal, sistema.value)
     await interaction.response.send_message(
-        f"✅ Painel de **{SYSTEMS[sistema.value]['label']}** enviado em {canal.mention}.",
+        f"✅ Painel de **{SYSTEMS.get(sistema.value, {"label": str(sistema.value).title()})['label']}** enviado em {canal.mention}.",
         ephemeral=True
     )
 
