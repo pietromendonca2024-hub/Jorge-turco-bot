@@ -2381,6 +2381,12 @@ class ApprovalView(discord.ui.View):
                 try:
                     if role:
                         await member.add_roles(role, reason="Registro aprovado")
+                    visitor_role = (
+                        interaction.guild.get_role(int(cfg["visitor_role_id"]))
+                        if cfg.get("visitor_role_id") else None
+                    )
+                    if visitor_role and visitor_role in member.roles:
+                        await member.remove_roles(visitor_role, reason="Registro aprovado")
                     pattern = cfg.get("name_pattern", "{id} | {nome}")
                     nick = pattern.replace("{id}", str(row["identificacao"])).replace("{nome}", str(row["nome"]))[:32]
                     await member.edit(nick=nick)
@@ -5760,6 +5766,223 @@ def _role_ids(*roles):
     return [r.id for r in roles if r is not None]
 
 
+# Estrutura oficial criada/aplicada pelo /reset. As permissões perigosas ficam
+# somente com a direção; os demais acessos são controlados por canal/categoria.
+ROLE_BLUEPRINT = [
+    ("👑 Dono", 0xE74C3C, discord.Permissions(administrator=True)),
+    ("👑 Sub-Dono", 0xC0392B, discord.Permissions(administrator=True)),
+    ("🔱 Líder", 0xF1C40F, discord.Permissions(
+        view_channel=True, send_messages=True, read_message_history=True,
+        connect=True, speak=True, stream=True, use_voice_activation=True,
+        manage_channels=True, manage_roles=True, manage_messages=True,
+        manage_nicknames=True, mention_everyone=True,
+    )),
+    ("🛡️ Sub-Líder", 0xE67E22, discord.Permissions(
+        view_channel=True, send_messages=True, read_message_history=True,
+        connect=True, speak=True, stream=True, use_voice_activation=True,
+        manage_messages=True, manage_nicknames=True, mention_everyone=True,
+    )),
+    ("⚜️ Gerente", 0x9B59B6, discord.Permissions(
+        view_channel=True, send_messages=True, read_message_history=True,
+        connect=True, speak=True, stream=True, use_voice_activation=True,
+        manage_messages=True, manage_nicknames=True, mention_everyone=True,
+    )),
+    ("🎯 Gerente de Ação", 0x3498DB, discord.Permissions(
+        view_channel=True, send_messages=True, read_message_history=True,
+        connect=True, speak=True, stream=True, use_voice_activation=True,
+    )),
+    ("💼 Gerente de Farm", 0x2ECC71, discord.Permissions(
+        view_channel=True, send_messages=True, read_message_history=True,
+        connect=True, speak=True, stream=True, use_voice_activation=True,
+    )),
+    ("🔴 Membro", 0xE74C3C, discord.Permissions(
+        view_channel=True, send_messages=True, read_message_history=True,
+        add_reactions=True, attach_files=True, embed_links=True,
+        connect=True, speak=True, stream=True, use_voice_activation=True,
+        use_application_commands=True,
+    )),
+    ("🆕 Recruta", 0x95A5A6, discord.Permissions(
+        view_channel=True, send_messages=True, read_message_history=True,
+        add_reactions=True, attach_files=True, embed_links=True,
+        connect=True, speak=True, stream=True, use_voice_activation=True,
+        use_application_commands=True,
+    )),
+    ("👤 Visitante", 0x7F8C8D, discord.Permissions(
+        view_channel=True, read_message_history=True,
+        use_application_commands=True,
+    )),
+    ("💤 Ausente", 0x34495E, discord.Permissions(
+        view_channel=True, read_message_history=True,
+    )),
+]
+
+
+def _ow(view=False, send=False, voice=False, mention=False, manage=False):
+    """Overwrite explícito para impedir heranças abertas acidentalmente."""
+    return discord.PermissionOverwrite(
+        view_channel=view,
+        read_message_history=view,
+        send_messages=send,
+        send_messages_in_threads=send,
+        create_public_threads=send,
+        create_private_threads=False,
+        add_reactions=send,
+        attach_files=send,
+        embed_links=send,
+        use_application_commands=view,
+        connect=voice,
+        speak=voice,
+        stream=voice,
+        use_voice_activation=voice,
+        mention_everyone=mention,
+        manage_messages=manage,
+    )
+
+
+async def _ensure_server_roles(guild: discord.Guild):
+    roles = {}
+    created = 0
+    updated = 0
+    for name, color, permissions in reversed(ROLE_BLUEPRINT):
+        role = _find_role_by_names(guild, name)
+        if role is None:
+            role = await guild.create_role(
+                name=name, colour=discord.Colour(color), permissions=permissions,
+                hoist=name not in {"🔴 Membro", "🆕 Recruta", "👤 Visitante", "💤 Ausente"},
+                mentionable=False, reason="Configuração completa pelo /reset",
+            )
+            created += 1
+        else:
+            # Não tenta editar cargos gerenciados por integração.
+            if not role.managed and guild.me and role < guild.me.top_role:
+                await role.edit(
+                    name=name, colour=discord.Colour(color), permissions=permissions,
+                    hoist=name not in {"🔴 Membro", "🆕 Recruta", "👤 Visitante", "💤 Ausente"},
+                    mentionable=False, reason="Atualização completa pelo /reset",
+                )
+                updated += 1
+        roles[_norm_discord_name(name)] = role
+
+    # Tenta colocar os cargos na ordem correta, sempre abaixo do cargo do bot.
+    if guild.me:
+        ordered = [_find_role_by_names(guild, item[0]) for item in ROLE_BLUEPRINT]
+        ordered = [r for r in ordered if r and r < guild.me.top_role and not r.managed]
+        if ordered:
+            top = max(1, guild.me.top_role.position - 1)
+            positions = {role: max(1, top - index) for index, role in enumerate(ordered)}
+            try:
+                await guild.edit_role_positions(positions=positions, reason="Hierarquia do /reset")
+            except discord.HTTPException:
+                pass
+    return roles, created, updated
+
+
+def _access_group_for_channel(channel):
+    """Retorna o nível de acesso a partir da categoria e das exceções do canal."""
+    cname = _norm_discord_name(channel.category.name if channel.category else "")
+    chname = _norm_discord_name(channel.name)
+
+    # Exceções sensíveis sempre vencem a regra da categoria.
+    if any(x in chname for x in ("logs", "backup", "advertencia", "promoco", "gerenciarmembro", "anuncioprivado", "criadordeembed")):
+        return "gestao"
+    if any(x in chname for x in ("registrospondentes", "aprovacaofarm", "aprovacaoausencia", "baulideranca")):
+        return "staff"
+    if chname in {_norm_discord_name(x) for x in ("registro", "boas-vindas", "regras", "informações", "informacoes")}:
+        return "entrada"
+    if any(x in cname for x in ("lideranca", "gestao", "administracao", "logs")):
+        return "gestao"
+    if "registro" in cname or any(x in cname for x in ("inicio", "comeceaqui")):
+        return "entrada"
+    return "membros"
+
+
+async def _reset_channel_permissions(guild: discord.Guild, roles: dict):
+    everyone = guild.default_role
+    bot_role = guild.me.top_role if guild.me else None
+    get = lambda name: roles.get(_norm_discord_name(name)) or _find_role_by_names(guild, name)
+
+    dono, sub_dono = get("Dono"), get("Sub-Dono")
+    lider, sub_lider, gerente = get("Líder"), get("Sub-Líder"), get("Gerente")
+    gerente_acao, gerente_farm = get("Gerente de Ação"), get("Gerente de Farm")
+    membro, recruta, visitante, ausente = get("Membro"), get("Recruta"), get("Visitante"), get("Ausente")
+    all_roles = [r for r in (dono, sub_dono, lider, sub_lider, gerente, gerente_acao, gerente_farm, membro, recruta, visitante, ausente) if r]
+    management = [r for r in (dono, sub_dono, lider, sub_lider, gerente) if r]
+    staff = list(dict.fromkeys(management + [r for r in (gerente_acao, gerente_farm) if r]))
+    members = list(dict.fromkeys(staff + [r for r in (membro, recruta, ausente) if r]))
+
+    async def apply(target, level):
+        is_voice = isinstance(target, (discord.VoiceChannel, discord.StageChannel))
+        overwrites = {everyone: _ow(False, False, False)}
+        if bot_role and not bot_role.is_default():
+            overwrites[bot_role] = _ow(True, True, True, True, True)
+
+        if level == "entrada":
+            # Apenas os canais de entrada aparecem para quem acabou de chegar.
+            if visitante:
+                can_write = "registro" in _norm_discord_name(target.name)
+                overwrites[visitante] = _ow(True, can_write, False)
+            for role in members:
+                overwrites[role] = _ow(True, True, is_voice, role in management, role in management)
+        elif level == "membros":
+            for role in members:
+                overwrites[role] = _ow(True, True, is_voice, role in management, role in management)
+            if visitante:
+                overwrites[visitante] = _ow(False, False, False)
+        elif level == "staff":
+            for role in staff:
+                overwrites[role] = _ow(True, True, is_voice, role in management, role in management)
+        else:  # gestão/liderança/logs
+            for role in management:
+                overwrites[role] = _ow(True, True, is_voice, True, True)
+
+        # Substitui overrides antigos: um allow direto no canal não poderá furar
+        # o bloqueio definido pelo reset.
+        await target.edit(overwrites=overwrites, reason="Permissões completas pelo /reset")
+
+    for category in guild.categories:
+        # A categoria recebe a base; cada canal recebe também um overwrite
+        # explícito para neutralizar permissões antigas que estavam abertas.
+        fake_level = _access_group_for_channel(category)
+        await apply(category, fake_level)
+        for channel in category.channels:
+            await apply(channel, _access_group_for_channel(channel))
+
+    for channel in [ch for ch in guild.channels if not isinstance(ch, discord.CategoryChannel) and ch.category is None]:
+        await apply(channel, _access_group_for_channel(channel))
+
+
+async def reset_server_setup(guild: discord.Guild):
+    roles, created, updated = await _ensure_server_roles(guild)
+    await _reset_channel_permissions(guild, roles)
+    apply_server_autoconfig(guild)
+    # O cargo automático precisa estar ligado; antes o ID era salvo mas a chave
+    # continuava False, fazendo o painel dizer que Visitante estava desativado.
+    visitante = _find_role_by_names(guild, "👤 Visitante", "Visitante")
+    membro = _find_role_by_names(guild, "🔴 Membro", "Membro")
+    update_config(
+        guild.id, "registro", visitor_enabled=True,
+        visitor_role_id=visitante.id if visitante else None,
+        approved_role_id=membro.id if membro else None,
+    )
+    assigned = 0
+    faction_roles = {
+        _find_role_by_names(guild, item[0]).id
+        for item in ROLE_BLUEPRINT
+        if _find_role_by_names(guild, item[0]) is not None
+    }
+    if visitante:
+        for member_obj in guild.members:
+            if member_obj.bot or member_obj == guild.owner:
+                continue
+            if not any(role.id in faction_roles for role in member_obj.roles):
+                try:
+                    await member_obj.add_roles(visitante, reason="Visitante aplicado pelo /reset")
+                    assigned += 1
+                except (discord.Forbidden, discord.HTTPException):
+                    pass
+    return created, updated, assigned
+
+
 def apply_server_autoconfig(guild: discord.Guild):
     """Mapeia os canais/cargos já existentes no servidor para os sistemas do bot.
 
@@ -6024,6 +6247,56 @@ def apply_server_autoconfig(guild: discord.Guild):
 # ============================================================
 # COMANDOS PRINCIPAIS
 # ============================================================
+
+@bot.tree.command(name="reset", description="Configura cargos e todas as permissões do servidor")
+@app_commands.default_permissions(administrator=True)
+async def reset_cmd(interaction: discord.Interaction):
+    if not is_admin(interaction.user):
+        return await deny(interaction)
+    if interaction.guild is None:
+        return await interaction.response.send_message(
+            "❌ Use este comando dentro do servidor.", ephemeral=True
+        )
+
+    me = interaction.guild.me
+    missing = []
+    if not me or not me.guild_permissions.manage_roles:
+        missing.append("Gerenciar Cargos")
+    if not me or not me.guild_permissions.manage_channels:
+        missing.append("Gerenciar Canais")
+    if missing:
+        return await interaction.response.send_message(
+            "❌ O cargo do bot precisa destas permissões: **" + ", ".join(missing) +
+            "**. Coloque também o cargo do bot acima de todos os cargos da facção.",
+            ephemeral=True,
+        )
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    try:
+        created, updated, assigned = await reset_server_setup(interaction.guild)
+        await interaction.followup.send(
+            "✅ **Servidor configurado com sucesso.**\n"
+            f"• Cargos criados: **{created}**\n"
+            f"• Cargos atualizados: **{updated}**\n"
+            f"• Visitantes aplicados agora: **{assigned}**\n"
+            "• Permissões antigas dos canais foram substituídas\n"
+            "• Visitante automático foi ativado\n"
+            "• Visitante vê somente entrada/registro\n"
+            "• Texto, marcações e calls foram configurados por hierarquia\n\n"
+            "Teste com uma conta comum, sem Administrador. A conta dona do servidor sempre vê tudo.",
+            ephemeral=True,
+        )
+    except discord.Forbidden:
+        await interaction.followup.send(
+            "❌ O Discord bloqueou uma alteração. Coloque o cargo do bot acima de todos os "
+            "cargos da facção e habilite **Gerenciar Cargos** e **Gerenciar Canais**.",
+            ephemeral=True,
+        )
+    except discord.HTTPException as exc:
+        await interaction.followup.send(
+            f"❌ Falha temporária do Discord (código {getattr(exc, 'code', '?')}). Tente o `/reset` novamente.",
+            ephemeral=True,
+        )
 
 @bot.tree.command(name="gerenciar", description="Abre o painel de gerenciamento do Bot Facção")
 @app_commands.default_permissions(administrator=True)
