@@ -5345,6 +5345,28 @@ async def on_message(message):
 
 @bot.event
 async def on_member_join(member):
+    # Todo novo membro começa como Visitante. O cargo é localizado pela
+    # configuração do Registro e, como segurança, também pelo nome do cargo.
+    rcfg = get_config(member.guild.id, "registro")
+    visitor_role = None
+    if rcfg.get("visitor_role_id"):
+        visitor_role = member.guild.get_role(int(rcfg["visitor_role_id"]))
+    if visitor_role is None:
+        visitor_role = discord.utils.find(
+            lambda role: role.name.casefold().replace("👤", "").strip() == "visitante",
+            member.guild.roles,
+        )
+    if visitor_role is not None:
+        try:
+            await member.add_roles(visitor_role, reason="Cargo automático de entrada")
+        except discord.Forbidden:
+            print(
+                f"⚠️ Não consegui aplicar Visitante a {member}. "
+                "Coloque o cargo do bot acima do cargo Visitante."
+            )
+        except discord.HTTPException as exc:
+            print(f"⚠️ Falha ao aplicar Visitante a {member}: {exc}")
+
     # Boas-vindas configurável
     wcfg = get_config(member.guild.id, "boas_vindas")
     if wcfg.get("enabled"):
